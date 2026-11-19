@@ -324,7 +324,7 @@ class NodeSeekV3(_PluginBase):
     plugin_name = "NodeSeek 论坛签到"
     plugin_desc = "通过 MoviePilot 浏览器定时执行 NodeSeek 论坛签到。"
     plugin_icon = ""
-    plugin_version = "1.6.1"
+    plugin_version = "1.7.0"
     plugin_label = "站点签到"
     plugin_author = "Aspeternity"
     author_url = "https://github.com/Aspeternity"

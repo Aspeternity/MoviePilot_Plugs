@@ -6,7 +6,7 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
 
 | 插件 | 插件 ID | 当前版本 | 最低 MoviePilot 版本 |
 | --- | --- | --- | --- |
-| NodeSeek 论坛签到 | `NodeSeekV3` | `1.6.1` | `3.2.8` |
+| NodeSeek 论坛签到 | `NodeSeekV3` | `1.7.0` | `3.2.8` |
 
 ## 安装
 
