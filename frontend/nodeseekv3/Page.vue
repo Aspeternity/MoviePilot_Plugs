@@ -48,8 +48,13 @@ onUnmounted(() => controller.abort())
       <VBtn class="mt-3" variant="tonal" @click="load">重试</VBtn>
     </VCardText>
     <VCardText v-else><Layout /></VCardText>
-    <VCardActions v-if="show_switch" class="app-dialog-actions">
-      <VBtn color="info" variant="tonal" prepend-icon="mdi-cog-outline" @click="emit('switch')">插件配置</VBtn>
+    <VCardActions
+      v-if="show_switch"
+      class="app-dialog-actions position-sticky bottom-0 justify-end bg-surface"
+      style="z-index: 1"
+    >
+      <VBtn icon="mdi-cog-outline" color="primary" variant="text"
+            aria-label="插件配置" title="插件配置" @click="emit('switch')" />
     </VCardActions>
   </div>
 </template>

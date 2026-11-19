@@ -423,7 +423,7 @@ class NodeSeekV3(_PluginBase):
 
     @staticmethod
     def get_render_mode() -> tuple[str, str]:
-        return "vue", "dist/assets/v2"
+        return "vue", "dist/assets/v3"
 
     def get_api(self) -> list[dict[str, Any]]:
         """注册需要管理员身份的只读登录验证接口。"""
