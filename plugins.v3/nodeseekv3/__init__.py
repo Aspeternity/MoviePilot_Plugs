@@ -8,6 +8,7 @@ import json
 import random
 import re
 import threading
+from threading import Timer
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
@@ -37,6 +38,11 @@ _TIME_PATTERN = r"(?:[01]\d|2[0-3]):[0-5]\d"
 _SIGN_SERVICE_ID = "NodeSeekV3"
 _WINDOW_PLAN_KEY = "random_window_next_run"
 _WINDOW_ATTEMPT_KEY = "random_window_last_attempt"
+_SIGN_STATE_KEY = "sign_state_v2"
+_LEGACY_SIGN_KEYS = ("sign_history", "last_result", "last_sign_date")
+_HISTORY_DAYS = 30
+_HISTORY_PAGE_SIZE = 10
+_REWARD_PATTERN = r"(?:签到收益|签到奖励|签到获得)[：:\s]*(?:(?:是|为|获得|得到|了)\s*)?(\d{1,6})\s*(?:个|只|枚)?\s*鸡腿"
 _CRONTAB_WEEKDAYS = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
 _WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 _WEEKDAY_BASIS = "sunday_zero"
@@ -101,6 +107,19 @@ class CookieCloudVerificationResult(TypedDict):
     success: bool
     status: str
     message: str
+
+
+class SignRecord(TypedDict):
+    day: str
+    time: str
+    success: bool | None
+    message: str
+    gain: int | None
+
+
+class SignState(TypedDict):
+    records: list[SignRecord]
+    confirmed_day: str | None
 
 
 def _require_administrator(token: schemas.TokenPayload = Depends(verify_token)) -> None:
@@ -287,6 +306,9 @@ class NodeSeekV3(_PluginBase):
         self._config = dict(self._defaults)
         self._lock = threading.Lock()
         self._window_attempt_lock = threading.Lock()
+        self._history_lock = threading.Lock()
+        self._history_timer: Timer | None = None
+        self._history_session: object | None = None
 
     @staticmethod
     def _selected_window(config: dict[str, Any], key: str) -> str | None:
@@ -309,6 +331,9 @@ class NodeSeekV3(_PluginBase):
         self._config.pop("_nodeseek_cloud_verifying", None)
         for key in ("window_start", "window_end"):
             self._config[key] = self._window_value(self._config, key)
+        with self._history_lock:
+            history_session = self._history_session = object()
+        self._maintain_history(history_session)
         if self._config.get("onlyonce"):
             self._config["onlyonce"] = False
             self.update_config(self._config)
@@ -576,7 +601,7 @@ class NodeSeekV3(_PluginBase):
             amount = int(value.strip())
             return amount if amount <= 100000 else None
         if isinstance(message, str):
-            match = re.search(r"(?<![\d.-])(\d{1,6})\s*(?:个|只|枚)?\s*鸡腿", message)
+            match = re.search(_REWARD_PATTERN, message)
             if match:
                 amount = int(match.group(1))
                 return amount if amount <= 100000 else None
@@ -602,7 +627,7 @@ class NodeSeekV3(_PluginBase):
             raw_message = result.get("message")
             already = isinstance(raw_message, str) and bool(re.search(r"(?:已经|已).{0,5}签到|签到.{0,5}(?:完成|过)", raw_message))
             gain = cls._gain(result.get("gain"), raw_message)
-            explicit_gain = isinstance(raw_message, str) and bool(re.search(r"(?:签到收益|签到奖励|签到获得).{0,12}\d+\s*(?:个|只|枚)?\s*鸡腿", raw_message))
+            explicit_gain = cls._gain(None, raw_message) is not None
             auth_error = isinstance(raw_message, str) and bool(re.search(r"未登录|请先登录|登录失效|USER NOT FOUND", raw_message, re.I))
             if result.get("ok") and auth_error:
                 output["message"] = "站点未识别登录状态，请检查 Cookie 是否有效"
@@ -659,27 +684,28 @@ class NodeSeekV3(_PluginBase):
             logger.warning("NodeSeek 签到正在运行，本次跳过")
             return
         try:
-            today = datetime.now(_BEIJING).date().isoformat()
-            if self.get_data("last_sign_date") == today:
+            sign_day = datetime.now(_BEIJING).date()
+            with self._history_lock:
+                _, _, state = self._read_sign_state(sign_day)
+            if state["confirmed_day"] == sign_day.isoformat():
                 logger.info("NodeSeek 今日已确认签到，跳过重复执行")
                 return
             result = self._request_sign()
-            previous = self.get_data("last_result") or {}
-            if (result.get("success") and result.get("message") == "今日已签到"
-                    and result.get("gain") is None and previous.get("success")
-                    and str(previous.get("time") or "").startswith(today)):
-                result["gain"] = self._gain(previous.get("gain"), previous.get("message"))
-            if result["success"]:
-                self.save_data("last_sign_date", today)
-            result["time"] = datetime.now(_BEIJING).isoformat(timespec="seconds")
-            history = self._history()
-            history.insert(0, dict(result))
-            self.save_data("sign_history", history)
-            self.save_data("last_result", result)
-            gain = result.get("gain")
-            gain_text = f"{gain} 个鸡腿" if gain is not None else "站点未返回，无法确认"
-            text = f"结果：{result['message']}\n签到奖励：{gain_text}\n时间：{result['time']}"
-            logger.info("NodeSeek 签到结果：%s，奖励：%s", result["message"], gain_text)
+            finished = datetime.now(_BEIJING)
+            record = self._record_from_data({**result, "day": sign_day.isoformat(), "time": finished.isoformat()})
+            if record is None:
+                return
+            with self._history_lock:
+                _, legacy, state = self._read_sign_state(finished.date())
+                state["records"].insert(0, record)
+                if record["success"] is True:
+                    state["confirmed_day"] = max(state["confirmed_day"] or "", record["day"])
+                if self._save_sign_state(state):
+                    self._discard_legacy_sign_data(legacy)
+                self._arm_history_timer()
+            gain_text = self._reward_text(record)
+            text = f"结果：{record['message']}\n签到奖励：{gain_text}\n时间：{self._format_time(record['time'])}"
+            logger.info("NodeSeek 签到结果：%s，奖励：%s", record["message"], gain_text)
             if self._config.get("notify"):
                 self.post_message(mtype=MessageType.SiteMessage, title="NodeSeek 论坛签到", text=text)
         finally:
@@ -714,13 +740,150 @@ class NodeSeekV3(_PluginBase):
         except ValueError:
             return str(value)
 
-    def _history(self) -> list[dict[str, Any]]:
-        """读取历史，旧版仅有最近结果时以该结果作为历史起点。"""
-        stored = self.get_data("sign_history")
-        if isinstance(stored, list):
-            return [item for item in stored if isinstance(item, dict)]
-        last = self.get_data("last_result")
-        return [dict(last)] if isinstance(last, dict) and last else []
+    @staticmethod
+    def _parse_day(value: Any) -> date | None:
+        try:
+            return date.fromisoformat(value) if isinstance(value, str) else None
+        except ValueError:
+            return None
+
+    @classmethod
+    def _record_from_data(cls, data: Any) -> SignRecord | None:
+        """规范化旧记录，无法识别日期的记录不能判断是否仍在保留期。"""
+        if not isinstance(data, dict) or not isinstance(data.get("time"), str):
+            return None
+        try:
+            finished = datetime.fromisoformat(data["time"])
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=_BEIJING)
+            finished = finished.astimezone(_BEIJING)
+        except (ValueError, OverflowError):
+            return None
+        day = cls._parse_day(data.get("day")) or finished.date()
+        success = data.get("success")
+        message = data.get("message")
+        if isinstance(message, str):
+            message = " ".join(message.split())[:300]
+        else:
+            message = ""
+        return {
+            "day": day.isoformat(),
+            "time": finished.isoformat(timespec="microseconds"),
+            "success": success if isinstance(success, bool) else None,
+            "message": message or ("签到成功" if success is True else "签到未确认"),
+            "gain": cls._gain(data.get("gain"), message) if success is True else None,
+        }
+
+    def _read_sign_state(
+        self, today: date, *, read_legacy: bool = False
+    ) -> tuple[Any, dict[str, Any], SignState]:
+        """读取一个签到快照，必要时合并旧记录。读取本身不写入。"""
+        stored = self.get_data(_SIGN_STATE_KEY)
+        has_snapshot = isinstance(stored, dict) and isinstance(stored.get("records"), list)
+        legacy = {}
+        if read_legacy or not has_snapshot:
+            for key in _LEGACY_SIGN_KEYS:
+                value = self.get_data(key)
+                if value is not None:
+                    legacy[key] = value
+        if has_snapshot:
+            raw_records = stored["records"]
+            confirmed = self._parse_day(stored.get("confirmed_day"))
+        else:
+            raw_records = legacy.get("sign_history")
+            confirmed = self._parse_day(legacy.get("last_sign_date"))
+        records = [
+            record for item in raw_records if (record := self._record_from_data(item)) is not None
+        ] if isinstance(raw_records, list) else []
+        if has_snapshot and isinstance(legacy.get("sign_history"), list):
+            seen = {tuple(record.values()) for record in records}
+            for item in legacy["sign_history"]:
+                restored = self._record_from_data(item)
+                if restored is not None and tuple(restored.values()) not in seen:
+                    records.append(restored)
+                    seen.add(tuple(restored.values()))
+        if legacy:
+            latest = self._record_from_data(legacy.get("last_result"))
+            if latest is not None and latest not in records:
+                records.append(latest)
+            legacy_day = self._parse_day(legacy.get("last_sign_date"))
+            if legacy_day and legacy_day <= today and (confirmed is None or confirmed > today or legacy_day > confirmed):
+                confirmed = legacy_day
+        today_text = today.isoformat()
+        cutoff = (today - timedelta(days=_HISTORY_DAYS - 1)).isoformat()
+        confirmed_day = confirmed.isoformat() if confirmed and confirmed <= today else None
+        records = [record for record in records if cutoff <= record["day"] <= today_text]
+        records.sort(key=lambda record: record["time"], reverse=True)
+        for record in records:
+            if record["success"] is True and (confirmed_day is None or record["day"] > confirmed_day):
+                confirmed_day = record["day"]
+        return stored, legacy, {"records": records, "confirmed_day": confirmed_day}
+
+    def _save_sign_state(self, state: SignState) -> bool:
+        try:
+            self.save_data(_SIGN_STATE_KEY, state)
+            # MoviePilot 的保存接口没有返回值，读回确认后才允许移除旧数据。
+            if self.get_data(_SIGN_STATE_KEY) == state:
+                return True
+        except Exception:
+            pass
+        logger.error("NodeSeek 签到记录保存失败")
+        return False
+
+    def _discard_legacy_sign_data(self, legacy: dict[str, Any]) -> bool:
+        try:
+            for key in legacy:
+                self.del_data(key)
+            if all(self.get_data(key) is None for key in legacy):
+                return True
+        except Exception:
+            pass
+        logger.warning("NodeSeek 旧签到数据清理失败，将在下次清理时重试")
+        return False
+
+    def _arm_history_timer(self) -> None:
+        """在下一个北京时间零点清理。历史任务随插件停止和重载而取消。"""
+        if self._history_session is None or self._history_timer is not None:
+            return
+        now = datetime.now(_BEIJING)
+        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        timer = Timer(max(1.0, (midnight - now).total_seconds()), self._maintain_history, (self._history_session,))
+        timer.daemon = True
+        self._history_timer = timer
+        timer.start()
+
+    def _maintain_history(self, session: object) -> None:
+        with self._history_lock:
+            if session is not self._history_session:
+                return
+            self._history_timer = None
+            try:
+                stored, legacy, state = self._read_sign_state(datetime.now(_BEIJING).date(), read_legacy=True)
+                needs_write = stored != state and (stored is not None or bool(legacy))
+                saved = stored == state or (needs_write and self._save_sign_state(state))
+                legacy_clean = not legacy or (saved and self._discard_legacy_sign_data(legacy))
+                if saved and legacy_clean and (needs_write or legacy):
+                    logger.info("NodeSeek 签到历史已整理，保留 %s 条", len(state["records"]))
+                if state["records"] or not legacy_clean or (stored is not None and not saved):
+                    self._arm_history_timer()
+            except Exception:
+                logger.warning("NodeSeek 签到历史清理失败，将在次日重试")
+                self._arm_history_timer()
+
+    @staticmethod
+    def _record_status(record: SignRecord) -> str:
+        if record["success"] is True:
+            return "站点已签到" if record["message"] == "今日已签到" else "签到成功"
+        if record["success"] is None or record["message"].startswith("签到未确认"):
+            return "未确认"
+        return "失败"
+
+    @staticmethod
+    def _reward_text(record: SignRecord) -> str:
+        if record["success"] is not True:
+            return "—"
+        gain = record["gain"]
+        return f"{gain} 个鸡腿" if gain is not None else "未知"
 
     def _legacy_cron_weekdays(self) -> str:
         """显示现有数字星期真正匹配的日期，避免用编辑器的编号猜测。"""
@@ -956,68 +1119,116 @@ class NodeSeekV3(_PluginBase):
             logger.warning("NodeSeek 无法读取已登记的签到任务")
             return "自动签到已开启", "暂时无法读取执行时间"
         if job is None:
+            if not self._config.get("cookiecloud") and not self._cookies(str(self._config.get("cookie") or "")):
+                return "签到任务未登记", "手动模式缺少可用 Cookie。"
             return "签到任务未登记", ""
         if job.next_run:
-            return "自动签到已开启", f"下次执行：{job.next_run}"
+            return "自动签到已开启", str(job.next_run)
         return "自动签到已开启", str(job.status or "")
 
-    def get_page(self) -> list[dict]:
-        """以卡片显示最近结果和当前计划，不显示 Cookie。"""
-        result = self.get_data("last_result") or {}
-        state, schedule_detail = self._schedule_overview()
-        status = result.get("message") or "暂无签到记录"
-        gain = self._gain(result.get("gain"))
-        if gain is None:
-            gain = self._gain(None, result.get("message"))
-        gain_text = f"{gain} 个鸡腿" if gain is not None else "未知（站点未返回）"
-        time_text = self._format_time(result.get("time"))
-        cards = [
-            ("最近结果", status, "mdi-check-circle-outline", "success" if result.get("success") else "info"),
-            ("签到奖励", gain_text, "mdi-food-drumstick-outline", "warning"),
-            ("最近执行", time_text, "mdi-clock-outline", "primary"),
-            ("自动签到", state, "mdi-calendar-clock", "warning" if state == "计划无效" else "primary"),
-        ]
-        cols = []
-        for title, value, icon, color in cards:
-            card_content = [
+    @staticmethod
+    def _overview_cell(title: str, value: str, icon: str, color: str, *details: str) -> dict:
+        return {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+            {"component": "VCard", "props": {"variant": "tonal", "color": color, "class": "pa-3 h-100"}, "content": [
                 {"component": "div", "props": {"class": "d-flex align-center text-caption"},
                  "content": [{"component": "VIcon", "props": {"size": "small", "class": "mr-2"}, "text": icon},
                              {"component": "span", "text": title}]},
-                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold mt-2"}, "text": str(value)},
-            ]
-            if title == "自动签到" and schedule_detail:
-                card_content.append({"component": "div", "props": {"class": "text-caption mt-1"}, "text": schedule_detail})
-            cols.append({"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": [
-                {"component": "VCard", "props": {"variant": "tonal", "color": color, "class": "pa-3 h-100"},
-                 "content": card_content},
-            ]})
-        overview = self._card("签到概览", "mdi-chart-box-outline", [
-            {"component": "VRow", "content": cols},
-        ])
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold mt-2"}, "text": value},
+                *[
+                    {"component": "div", "props": {"class": "text-caption mt-1 text-wrap"}, "text": detail}
+                    for detail in details if detail
+                ],
+            ]},
+        ]}
+
+    def _history_table(self, records: list[SignRecord]) -> dict:
         rows = []
-        for record in self._history():
-            amount = self._gain(record.get("gain"), record.get("message"))
-            reward = f"{amount} 个鸡腿" if amount is not None else "未知"
-            message = str(record.get("message") or "未知")
+        for record in records:
+            label = self._record_status(record)
+            description = label if record["message"] in {label, "今日已签到"} else f"{label} · {record['message']}"
             rows.append({"component": "tr", "content": [
-                {"component": "td", "props": {"style": "white-space: nowrap;"},
-                 "text": self._format_time(record.get("time"))},
-                {"component": "td", "text": message},
-                {"component": "td", "text": reward},
+                {"component": "td", "props": {"class": "text-caption text-wrap"}, "text": self._format_time(record["time"])},
+                {"component": "td", "props": {"class": "text-wrap", "style": {"overflow-wrap": "anywhere"}},
+                 "text": description},
+                {"component": "td", "props": {"class": "text-end text-no-wrap px-2"}, "text": self._reward_text(record)},
             ]})
-        history = self._card("签到历史", "mdi-history", [{"component": "VTable",
-            "props": {"density": "comfortable", "fixed-header": True}, "content": [
-                {"component": "thead", "content": [{"component": "tr", "content": [
-                    {"component": "th", "text": "时间（北京时间）"},
-                    {"component": "th", "text": "结果"},
-                    {"component": "th", "text": "奖励"}]}]},
-                {"component": "tbody", "content": rows},
-            ]}] if rows else [{"component": "VAlert", "props": {
-                "type": "info", "variant": "tonal", "text": "暂无签到记录"}}])
-        return [overview, history]
+        return {"component": "VTable", "props": {"density": "compact"}, "content": [
+            {"component": "thead", "content": [{"component": "tr", "content": [
+                {"component": "th", "props": {"style": {"width": "116px"}}, "text": "时间"},
+                {"component": "th", "text": "结果"},
+                {"component": "th", "props": {"class": "text-end px-2", "style": {"width": "80px"}}, "text": "奖励"},
+            ]}]},
+            {"component": "tbody", "content": rows},
+        ]}
+
+    def _history_page(self, records: list[SignRecord]) -> dict:
+        content = [{"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-2"},
+                    "text": f"最近 {_HISTORY_DAYS} 天 · 北京时间"}]
+        if not records:
+            content.append({"component": "p", "props": {"class": "text-body-2 text-medium-emphasis mb-0"},
+                            "text": "暂无签到记录"})
+        elif len(records) <= _HISTORY_PAGE_SIZE:
+            content.append(self._history_table(records))
+        else:
+            pages = []
+            for start in range(0, len(records), _HISTORY_PAGE_SIZE):
+                page = start // _HISTORY_PAGE_SIZE + 1
+                end = min(start + _HISTORY_PAGE_SIZE, len(records))
+                pages.append({"component": "VExpansionPanel", "props": {"value": page, "elevation": 0}, "content": [
+                    {"component": "VExpansionPanelTitle", "text": f"第 {page} 页 · {start + 1}–{end} 条"},
+                    {"component": "VExpansionPanelText", "content": [self._history_table(records[start:end])]},
+                ]})
+            content.append({"component": "VExpansionPanels", "props": {"modelValue": 1, "variant": "accordion"},
+                            "content": pages})
+        return self._card("签到历史", "mdi-history", content)
+
+    def get_page(self) -> list[dict]:
+        """显示签到快照和实际登记的调度任务，页面查询只读。"""
+        today = datetime.now(_BEIJING).date()
+        with self._history_lock:
+            _, _, history_state = self._read_sign_state(today)
+        records = history_state["records"]
+        today_text = today.isoformat()
+        recent_today = next((record for record in records if record["day"] == today_text), None)
+        if history_state["confirmed_day"] == today_text:
+            today_status, today_color = "已确认签到", "success"
+        elif recent_today is not None and self._record_status(recent_today) == "失败":
+            today_status, today_color = "今日最近一次失败", "error"
+        elif recent_today is not None:
+            today_status, today_color = "今日最近一次未确认", "warning"
+        else:
+            today_status, today_color = "今日暂无确认记录", "info"
+
+        latest = records[0] if records else None
+        latest_status = self._record_status(latest) if latest else "暂无签到记录"
+        latest_details = []
+        if latest:
+            if latest["message"] not in {latest_status, "今日已签到"}:
+                latest_details.append(latest["message"])
+            latest_details.extend([self._format_time(latest["time"]), f"奖励：{self._reward_text(latest)}"])
+        state, schedule_detail = self._schedule_overview()
+        next_value, next_detail = (schedule_detail, state) if state == "自动签到已开启" and schedule_detail else (
+            state, schedule_detail
+        )
+        overview = self._card("签到概览", "mdi-chart-box-outline", [
+            {"component": "VRow", "props": {"dense": True}, "content": [
+                self._overview_cell("今日签到", today_status, "mdi-calendar-check-outline", today_color),
+                self._overview_cell("最近一次", latest_status, "mdi-clock-outline", "primary", *latest_details),
+                self._overview_cell(
+                    "下次执行", next_value, "mdi-calendar-clock", "warning" if state == "计划无效" else "primary",
+                    next_detail,
+                ),
+            ]},
+        ])
+        return [overview, self._history_page(records)]
 
     def stop_service(self) -> None:
-        """取消尚未执行的一次性任务。"""
+        """取消历史清理和尚未执行的一次性签到。"""
+        with self._history_lock:
+            self._history_session = None
+            if self._history_timer is not None:
+                self._history_timer.cancel()
+                self._history_timer = None
         try:
             remove_plugin_once_job(self.__class__.__name__, "once")
         except RuntimeError:

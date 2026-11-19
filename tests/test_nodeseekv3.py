@@ -33,6 +33,10 @@ def plugin_module(monkeypatch):
             """保存测试数据。"""
             self.data[key] = value
 
+        def del_data(self, key):
+            """删除指定的测试数据。"""
+            self.data.pop(key, None)
+
         def update_config(self, config):
             """记录测试配置。"""
             self.saved_config = config.copy()
@@ -81,6 +85,24 @@ def plugin_module(monkeypatch):
     spec = importlib.util.spec_from_file_location("test_nodeseek_plugin", ROOT / "plugins.v3/nodeseekv3/__init__.py")
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
+
+    class FakeTimer:
+        """保留待触发的回调，无需创建后台线程。"""
+
+        def __init__(self, delay, function, args):
+            self.delay, self.function, self.args = delay, function, args
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.function(*self.args)
+
+    monkeypatch.setattr(loaded, "Timer", FakeTimer)
     return loaded
 
 
@@ -497,16 +519,18 @@ def test_sign_idempotence_and_failed_retry(plugin_module, monkeypatch):
 
     monkeypatch.setattr(plugin, "_request_sign", request)
     plugin.sign()
-    assert "last_sign_date" not in plugin.data
+    state_key = plugin_module._SIGN_STATE_KEY
+    assert plugin.data[state_key]["confirmed_day"] is None
     plugin.sign()
     today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
-    assert plugin.data["last_sign_date"] == today
+    assert plugin.data[state_key]["confirmed_day"] == today
     plugin.sign()
     assert len(calls) == 2
     assert len(plugin.notifications) == 2
-    assert "无法确认" in plugin.notifications[0]["text"]
+    assert "签到奖励：—" in plugin.notifications[0]["text"]
     assert "7 个鸡腿" in plugin.notifications[1]["text"]
-    assert plugin.data["last_result"]["gain"] == 7
+    assert plugin.data[state_key]["records"][0]["gain"] == 7
+    assert set(plugin.data) == {state_key}
 
 
 def test_once_and_overlap(plugin_module, monkeypatch):
@@ -723,16 +747,17 @@ def test_schedule_overview_reads_registered_job_without_drawing(plugin_module, m
         types.SimpleNamespace(id="NodeSeekV3_NodeSeekV3", next_run="1 小时", status="等待"),
     ])
     overview = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "下次执行：1 小时" in overview and "5 分钟" not in overview
+    assert "下次执行" in overview and "1 小时" in overview and "5 分钟" not in overview
     assert plugin.data == {}
 
     plugin.init_plugin({"enabled": True, "schedule_mode": "window", "window_start": "10:00", "window_end": "08:00"})
     overview = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "计划无效" in overview and "下次执行" not in overview
+    assert "计划无效" in overview and "1 小时" not in overview
 
 
 @pytest.mark.parametrize("value,message,expected", [(0, "", 0), ("7", "", 7),
     (None, "今天的签到收益是5个鸡腿", 5), (None, "账号 42，签到失败", None),
+    (None, "签到成功，当前余额 42 个鸡腿", None),
     (True, "", None), (-1, "", None), (1.5, "", None)])
 def test_gain_parse(plugin_module, value, message, expected):
     """只提取明确鸡腿数，未知与零值严格区分。"""
@@ -742,21 +767,26 @@ def test_gain_parse(plugin_module, value, message, expected):
 def test_overview_legacy_and_known_gain(plugin_module):
     """概览兼容旧记录，并展示新记录的奖励数。"""
     plugin = plugin_module.NodeSeekV3()
-    plugin.data["last_result"] = {"success": True, "message": "今日已签到", "time": "2026-11-18"}
-    assert "未知（站点未返回）" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    yesterday = datetime.now(plugin_module._BEIJING).date() - timedelta(days=1)
+    plugin.data["sign_history"] = []
+    plugin.data["last_result"] = {"success": True, "message": "今日已签到", "time": yesterday.isoformat()}
+    page = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "奖励：未知" in page and "今日暂无确认记录" in page and "站点已签到" in page
+    assert "暂无签到记录" not in page
     plugin.data["last_result"]["gain"] = 0
     assert "0 个鸡腿" in json.dumps(plugin.get_page(), ensure_ascii=False)
 
 
-def test_already_without_gain_preserves_today_reward(plugin_module, monkeypatch):
-    """站点未给重复签到奖励时，保留同一日已记录的奖励。"""
+def test_legacy_today_confirmation_skips_repeated_sign_and_keeps_reward(plugin_module, monkeypatch):
+    """旧的同日成功记录也可以确认当天已签，且保留原奖励。"""
     plugin = plugin_module.NodeSeekV3()
     today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
     plugin.data["last_result"] = {"time": today + "T00:30:00+08:00", "success": True, "gain": 4}
-    monkeypatch.setattr(plugin, "_request_sign", lambda: {"success": True, "message": "今日已签到", "gain": None})
+    monkeypatch.setattr(plugin, "_request_sign", lambda: pytest.fail("已确认的旧记录不应重复签到"))
+    plugin.init_plugin()
     plugin.sign()
-    assert plugin.data["last_result"]["gain"] == 4
-    assert "4 个鸡腿" in plugin.notifications[0]["text"]
+    assert plugin.data[plugin_module._SIGN_STATE_KEY]["records"][0]["gain"] == 4
+    assert not plugin.notifications
 
 
 def test_no_false_success_for_failed_or_unrelated_message(plugin_module):
@@ -766,6 +796,8 @@ def test_no_false_success_for_failed_or_unrelated_message(plugin_module):
     assert not interpret({"kind": "result", "ok": True, "success": True,
                           "message": "请先登录，签到奖励5个鸡腿"})["success"]
     assert interpret({"kind": "result", "ok": True, "message": "今日已完成签到"})["success"]
+    confirmed = interpret({"kind": "result", "ok": True, "success": True, "message": "当前余额5个鸡腿"})
+    assert confirmed["success"] is True and confirmed["gain"] is None
 
 
 def test_split_time_preserves_legacy_saved_config(plugin_module):
@@ -818,19 +850,20 @@ def test_split_time_invalid_never_silently_resets(plugin_module):
 def test_history_keeps_legacy_and_records_success_failure(plugin_module, monkeypatch):
     """保留旧版最近结果并累计后续失败和成功，不覆盖已有历史。"""
     plugin = plugin_module.NodeSeekV3()
-    old = {"time": "2026-01-02T03:04:05+08:00", "message": "旧记录", "success": True, "gain": 3}
+    yesterday = (datetime.now(plugin_module._BEIJING).date() - timedelta(days=1)).isoformat()
+    old = {"time": f"{yesterday}T03:04:05+08:00", "message": "旧记录", "success": True, "gain": 3}
     plugin.data["last_result"] = old.copy()
     sequence = iter([{"success": False, "message": "网络错误", "gain": None},
                      {"success": True, "message": "签到成功", "gain": 8}])
     monkeypatch.setattr(plugin, "_request_sign", lambda: next(sequence))
     plugin.sign()
     plugin.sign()
-    history = plugin.data["sign_history"]
+    history = plugin.data[plugin_module._SIGN_STATE_KEY]["records"]
     assert [record["message"] for record in history] == ["签到成功", "网络错误", "旧记录"]
-    assert old == history[-1]
+    assert history[-1]["gain"] == 3 and history[-1]["day"] == yesterday
     page = json.dumps(plugin.get_page(), ensure_ascii=False)
     assert "签到历史" in page and "旧记录" in page and "8 个鸡腿" in page
-    assert "2026-01-02 03:04:05" in page and "2026-01-02T03:04:05" not in page
+    assert f"{yesterday} 03:04:05" in page and f"{yesterday}T03:04:05" not in page
     assert "Cron：" not in page
 
 
@@ -841,3 +874,102 @@ def test_time_format_and_empty_history(plugin_module):
     assert plugin._format_time("2026-11-18T09:27:13+08:00") == "2026-11-18 09:27:13"
     assert plugin._format_time("非标准时间") == "非标准时间"
     assert "暂无签到记录" in json.dumps(plugin.get_page(), ensure_ascii=False)
+
+
+def test_malformed_legacy_and_failed_reward_are_safe(plugin_module):
+    plugin = plugin_module.NodeSeekV3()
+    plugin.data["last_result"] = ["malformed"]
+    assert "暂无签到记录" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    plugin.data["last_result"] = {
+        "time": datetime.now(plugin_module._BEIJING).isoformat(),
+        "success": False, "message": "当前余额 5 个鸡腿", "gain": 5,
+    }
+    overview = json.dumps(plugin.get_page()[0], ensure_ascii=False)
+    assert "今日最近一次失败" in overview and "奖励：—" in overview
+
+
+@pytest.fixture
+def history_clock(plugin_module, monkeypatch):
+    current = [datetime(2026, 11, 19, 12, tzinfo=plugin_module._BEIJING)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current[0].astimezone(tz)
+
+    monkeypatch.setattr(plugin_module, "datetime", Clock)
+    return current
+
+
+def test_retention_migrates_prunes_daily_and_stops_with_plugin(plugin_module, history_clock):
+    plugin = plugin_module.NodeSeekV3()
+    today = history_clock[0]
+    rows = [
+        {"time": (today - timedelta(days=offset)).isoformat(), "success": False, "message": f"记录 {offset}"}
+        for offset in (30, 29, 0, 0)
+    ]
+    plugin.data.update(sign_history=rows, last_result=rows[-1], cookiecloud_synced_cookie="fixture")
+    plugin.init_plugin({"enabled": False})
+    state_key = plugin_module._SIGN_STATE_KEY
+    assert set(plugin.data) == {state_key, "cookiecloud_synced_cookie"}
+    assert [record["message"] for record in plugin.data[state_key]["records"]] == ["记录 0", "记录 0", "记录 29"]
+    timer = plugin._history_timer
+    assert timer.delay == 12 * 60 * 60
+    history_clock[0] = today + timedelta(days=1)
+    assert "记录 29" not in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert len(plugin.data[state_key]["records"]) == 3  # 查看页面只读
+    timer.fire()
+    assert [r["message"] for r in plugin.data[state_key]["records"]] == ["记录 0", "记录 0"]
+    next_timer = plugin._history_timer
+    plugin.stop_service()
+    assert next_timer.cancelled
+    history_clock[0] = today + timedelta(days=31)
+    next_timer.fire()  # 模拟重新初始化前已经排队的旧回调
+    assert len(plugin.data[state_key]["records"]) == 2
+    plugin.init_plugin()
+    assert plugin.data[state_key]["records"] == []
+
+
+def test_legacy_data_not_deleted_until_snapshot_is_readable(plugin_module, history_clock, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    old = {"time": history_clock[0].isoformat(), "success": True, "message": "签到成功"}
+    plugin.data["last_result"] = old
+    save = plugin.save_data
+    monkeypatch.setattr(plugin, "save_data", lambda *args: None)
+    plugin.init_plugin()
+    assert plugin.data == {"last_result": old}
+    assert "已确认签到" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    monkeypatch.setattr(plugin, "save_data", save)
+    plugin._history_timer.fire()
+    assert set(plugin.data) == {plugin_module._SIGN_STATE_KEY}
+
+
+def test_midnight_preserves_sign_day_and_completion_time(plugin_module, history_clock, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    started = history_clock[0].replace(hour=23, minute=59)
+    history_clock[0] = started
+
+    def sign():
+        history_clock[0] += timedelta(minutes=2)
+        return {"success": True, "message": "签到成功", "gain": 0}
+
+    monkeypatch.setattr(plugin, "_request_sign", sign)
+    plugin.sign()
+    state = plugin.data[plugin_module._SIGN_STATE_KEY]
+    assert state["confirmed_day"] == state["records"][0]["day"] == started.date().isoformat()
+    assert state["records"][0]["time"].startswith(history_clock[0].date().isoformat() + "T00:01")
+    assert "今日暂无确认记录" in json.dumps(plugin.get_page()[0], ensure_ascii=False)
+
+
+def test_history_has_ten_rows_per_page_in_chronological_order(plugin_module, history_clock):
+    plugin = plugin_module.NodeSeekV3()
+    today = history_clock[0]
+    plugin.data["sign_history"] = [
+        {"time": (today - timedelta(days=offset)).isoformat(), "success": False, "message": f"记录 {offset}"}
+        for offset in reversed(range(21))
+    ]
+    panels = plugin.get_page()[1]["content"][2]["content"][1]
+    assert panels["props"]["modelValue"] == 1
+    rows = [panel["content"][1]["content"][0]["content"][1]["content"] for panel in panels["content"]]
+    assert [len(page) for page in rows] == [10, 10, 1]
+    assert rows[1][0]["content"][1]["text"] == "失败 · 记录 10"
