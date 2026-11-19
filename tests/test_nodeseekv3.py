@@ -444,7 +444,7 @@ def test_cookiecloud_verification_requires_admin(plugin_module):
     """验证接口要求管理员，且不再暴露获取 Cookie 接口。"""
     plugin = plugin_module.NodeSeekV3()
     routes = plugin.get_api()
-    assert {route["path"] for route in routes} == {"/cookiecloud_verify", "/manual_verify"}
+    assert {route["path"] for route in routes} == {"/cookiecloud_verify", "/manual_verify", "/config_login_check"}
     for route in routes:
         assert route["auth"] == "bear" and route["methods"] == ["POST"]
         assert route["dependencies"][0].dependency == plugin_module._require_administrator
@@ -465,6 +465,55 @@ def test_manual_verification_reads_draft_without_writing_settings(plugin_module,
     assert result["success"] and context.closed and context.cookies[0]["value"] == "draft-private"
     assert plugin._config["cookie"] == "session=saved" and not plugin.data
     assert "draft-private" not in repr(result) + repr(plugin_module.logger.messages)
+
+
+def test_save_preflight_failure_preserves_running_schedule_and_saved_settings(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    config = {"enabled": True, "cookie": "session=approved"}
+    plugin.init_plugin(config)
+    calls = []
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: calls.append(cfg["cookiecloud"]) or "cookie_missing")
+    before = plugin.data.copy()
+    result = plugin.check_config_login(plugin_module.ConfigLoginOptions(cookiecloud=True))
+    assert not result["success"] and result["status"] == "cookie_missing"
+    assert plugin.get_state() and plugin.get_service()[0]["id"] == "NodeSeekV3"
+    assert plugin._config["cookie"] == config["cookie"] and plugin._config["cookiecloud"] is False
+    assert plugin.data == before and not hasattr(plugin, "saved_config")
+    assert calls == [True]
+
+
+def test_save_preflight_and_init_share_recent_verification_by_login_options(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    time = [123.0]
+    calls = []
+    monkeypatch.setattr(plugin_module, "monotonic", lambda: time[0])
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: calls.append(cfg["user_agent"]) or "authenticated")
+    options = plugin_module.ConfigLoginOptions(cookiecloud=False, cookie="session=valid", user_agent="UA")
+    assert plugin.check_config_login(options.model_copy(update={"force": True}))["success"]
+    assert plugin.check_config_login(options)["success"]
+    assert calls == ["UA"] and not plugin.data
+    plugin.init_plugin({"onlyonce": True, "cookie": "session=valid", "user_agent": "UA"})
+    assert calls == ["UA"] and plugin.saved_config["onlyonce"] is False
+
+    changed = options.model_copy(update={"user_agent": "Alt"})
+    assert plugin.check_config_login(changed)["success"]
+    time[0] += plugin_module._RECENT_LOGIN_SECONDS + 1
+    assert plugin.check_config_login(changed)["success"]
+    assert calls == ["UA", "Alt", "Alt"]
+
+
+def test_rechecking_a_failed_login_can_resume_periodic_signup(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    options = plugin_module.ConfigLoginOptions(cookiecloud=True)
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: "signed_out")
+    plugin.init_plugin({"enabled": True, "cookiecloud": True})
+    assert plugin.get_state() is False
+    assert plugin.check_config_login(options)["success"] is False
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: "authenticated")
+    assert plugin.check_config_login(options)["success"] is True
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: pytest.fail("保存应复用刚通过的检查"))
+    plugin.init_plugin({"enabled": True, "cookiecloud": True})
+    assert plugin.get_state() is True
 
 
 @pytest.mark.parametrize("settings, cloud, browser_state, reason", [
@@ -543,13 +592,19 @@ def test_cookiecloud_source_config_ui(plugin_module):
     toggle = next(node for node in account if node["component"] == "VBtnToggle")
     assert toggle["props"]["model"] == "cookiecloud"
     assert {button["props"]["value"] for button in toggle["content"]} == {False, True}
-    manual = next(node for node in account if node["props"].get("show") == "{{!cookiecloud}}")
+    manual = next(node for node in account if node.get("show") == "useManual")
     assert manual["content"][0]["props"]["type"] == "password"
-    cloud = next(node for node in account if node["props"].get("show") == "{{cookiecloud}}")
-    button = next(node for node in cloud["content"] if node["component"] == "VBtn")
-    assert button["text"] == "验证 CookieCloud 登录" and "cookiecloud_verify" in button["props"]["onclick"]
+    assert any(node.get("show") == "useCloud" for node in account)
+    button = next(node for node in account if node["component"] == "VBtn")
+    assert button["action"] == "verifyLogin" and button["bind"]["text"] == "verifyLabel"
     assert any(node["component"] == "VExpansionPanels" for node in account)
-    assert "alert(" not in button["props"]["onclick"] and "_nodeseek_cloud_verifying" not in defaults
+    switches = cards[0]["content"][2]["content"][0]["content"]
+    for column in switches[:2]:
+        assert "disabled" not in column["content"][0]["props"]
+    assert "_nodeseek_cloud_verifying" not in defaults
+    mode, assets = plugin.get_render_mode()
+    assert mode == "vue"
+    assert (ROOT / "plugins.v3" / "nodeseekv3" / assets / "remoteEntry.js").is_file()
     assert "CookieCloud 检测" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     for value in (False, True):
         plugin.init_plugin({"cookiecloud": value, "cookie": "session=manual", "custom": "keep"})
@@ -808,10 +863,10 @@ def test_form_conditional_time_selection(plugin_module):
     form, _ = plugin.get_form()
     schedule = form[0]["content"][1]["content"][2]["content"]
     assert [(node["text"], node["props"]["value"]) for node in schedule[0]["content"]] == [
-        ("随机时段", "{{'window'}}"), ("Cron 定时", "{{'cron'}}"),
+        ("随机时段", "window"), ("Cron 定时", "cron"),
     ]
-    assert schedule[1]["props"]["show"] == "{{schedule_mode === 'cron'}}"
-    assert schedule[2]["props"]["show"] == "{{schedule_mode === 'window'}}"
+    assert schedule[1]["show"] == "cronMode"
+    assert schedule[2]["show"] == "windowMode"
     for group, label in zip(schedule[2]["content"][0]["content"], ("开始时间", "结束时间"), strict=True):
         assert group["content"][0]["text"] == label
         for col, count in zip(group["content"][1]["content"], (24, 60), strict=True):

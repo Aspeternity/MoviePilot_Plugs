@@ -10,6 +10,7 @@ import random
 import re
 import threading
 from threading import Timer
+from time import monotonic
 from typing import Any, NamedTuple, TypedDict
 from urllib.parse import urlsplit
 
@@ -34,8 +35,8 @@ _BASE_URL = "https://www.nodeseek.com"
 _SITE_HOST = urlsplit(_BASE_URL).netloc
 _BEIJING = timezone(timedelta(hours=8))
 _LOGIN_STATE_KEY = "login_validation"
-_VERIFY_STATE_KEY = "nodeseek:login-verification"
 _RECHECK_FIELD = "_nodeseek_verify_on_save"
+_RECENT_LOGIN_SECONDS = 300
 _CHALLENGE_TITLES = ("just a moment", "attention required", "请稍候")
 _TIME_PATTERN = r"(?:[01]\d|2[0-3]):[0-5]\d"
 _SIGN_SERVICE_ID = "NodeSeekV3"
@@ -108,6 +109,11 @@ class CookieCloudVerificationOptions(BaseModel):
 
 class ManualVerificationOptions(CookieCloudVerificationOptions):
     cookie: str = Field(default="", repr=False)
+
+
+class ConfigLoginOptions(ManualVerificationOptions):
+    cookiecloud: StrictBool
+    force: StrictBool = False
 
 
 class CookieCloudVerificationResult(TypedDict):
@@ -345,6 +351,7 @@ class NodeSeekV3(_PluginBase):
         self._registered_trigger: SignupCronTrigger | RandomWindowTrigger | None = None
         self._login_failure = ""
         self._login_blocks_schedule = False
+        self._recent_login_checks: dict[str, float] = {}
 
     @staticmethod
     def _selected_window(config: dict[str, Any], key: str) -> str | None:
@@ -376,7 +383,9 @@ class NodeSeekV3(_PluginBase):
             known = self._saved_login(binding)
             status, blocked_schedule = str(known.get("status") or ""), known.get("scheduled") is True
             if enabled or once:
-                if recheck is True or status not in ("authenticated", "signed_out"):
+                if recheck is not True and self._checked_recently(binding):
+                    status = "authenticated"
+                elif recheck is True or status not in ("authenticated", "signed_out"):
                     status = self._check_login(desired)
                 blocked_schedule = (enabled or blocked_schedule) and status != "authenticated"
                 if enabled or status != "authenticated":
@@ -412,6 +421,10 @@ class NodeSeekV3(_PluginBase):
         """不注册远程命令。"""
         return []
 
+    @staticmethod
+    def get_render_mode() -> tuple[str, str]:
+        return "vue", "dist/assets"
+
     def get_api(self) -> list[dict[str, Any]]:
         """注册需要管理员身份的只读登录验证接口。"""
         return [
@@ -421,6 +434,7 @@ class NodeSeekV3(_PluginBase):
             for path, endpoint, title in (
                 ("/cookiecloud_verify", self.verify_cookiecloud_login, "验证 CookieCloud 登录"),
                 ("/manual_verify", self.verify_manual_login, "验证手动 Cookie"),
+                ("/config_login_check", self.check_config_login, "保存前检查 NodeSeek 登录"),
             )
         ]
 
@@ -563,6 +577,34 @@ class NodeSeekV3(_PluginBase):
         """使用草稿中的手动 Cookie 和网络设置，只读检查登录。"""
         config = {**self._config, **options.model_dump(exclude_none=True), "cookiecloud": False}
         return self._verification_result(self._check_login(config), config)
+
+    def _checked_recently(self, binding: str) -> bool:
+        return self._recent_login_checks.get(binding, 0) > monotonic()
+
+    def check_config_login(self, options: ConfigLoginOptions) -> CookieCloudVerificationResult:
+        """在宿主写入设置前验证草稿。成功结果仅在本进程内短期有效。"""
+        draft = options.model_dump(exclude_none=True, exclude={"force"})
+        config = {**self._config, **draft}
+        binding = self._login_binding(config)
+        with self._config_lock:
+            reusable = not options.force and (
+                self._checked_recently(binding) or self._saved_login(binding).get("status") == "authenticated"
+            )
+        if reusable:
+            return {"success": True, "status": "authenticated", "message": _VERIFICATION_MESSAGES["authenticated"]}
+
+        status = self._check_login(config)
+        with self._config_lock:
+            self._recent_login_checks.pop(binding, None)
+            if status == "authenticated":
+                now = monotonic()
+                self._recent_login_checks = {
+                    key: expires for key, expires in self._recent_login_checks.items() if expires > now
+                }
+                if len(self._recent_login_checks) >= 16:
+                    del self._recent_login_checks[next(iter(self._recent_login_checks))]
+                self._recent_login_checks[binding] = now + _RECENT_LOGIN_SECONDS
+        return self._verification_result(status, config)
 
     def _check_login(self, config: dict[str, Any]) -> str:
         status, cookies = self._login_source(config)
@@ -826,7 +868,9 @@ class NodeSeekV3(_PluginBase):
             if config is not self._config:
                 return
             was_enabled = self.get_state()
-            self._save_login(self._login_binding(config), "signed_out", was_enabled)
+            binding = self._login_binding(config)
+            self._recent_login_checks.pop(binding, None)
+            self._save_login(binding, "signed_out", was_enabled)
             self._login_failure, self._login_blocks_schedule = "signed_out", was_enabled
             # 这里仅记录失效状态，避免覆盖管理员正在保存的完整配置。
             self._config = {**config, "enabled": False}
@@ -1092,36 +1136,17 @@ class NodeSeekV3(_PluginBase):
                 children.append(error)
             return {"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": children}
 
-        def time_text(key: str) -> str:
-            return f"(String(model.{key}_hour ?? '') + ':' + String(model.{key}_minute ?? ''))"
-
-        start, end = time_text("window_start"), time_text("window_end")
-        complete = f"(/^{_TIME_PATTERN}$/.test({start}) && /^{_TIME_PATTERN}$/.test({end}))"
-        valid = f"({complete} && {start} < {end})"
-        error = {"component": "p", "props": {
-            "show": f"{{{{!{valid}}}}}", "class": "text-caption text-error mt-2 mb-0",
-            "role": "alert", "textContent": (
-                f"{{{{{complete} ? '结束时间须晚于开始时间，且在同一天。' : '请选择完整的开始和结束时间。'}}}}"
-            ),
-        }}
-        # MoviePilot 的 Cron 输入和可视编辑器共用更新事件。只有实际改动星期才切换编号方式。
-        edit_cron = r"""function(value) {
-          const previous = String(model.cron ?? '').trim().split(/\s+/);
-          const next = String(value ?? '').trim().split(/\s+/);
-          if (next.length === 5 && (previous.length !== 5 || previous[4].toLowerCase() !== next[4].toLowerCase())) {
-            model.cron_weekday_basis = 'sunday_zero';
-          }
-          model.cron = value;
-        }"""
+        error = {"component": "p", "show": "windowError", "bind": {"textContent": "windowError"},
+                 "props": {"class": "text-caption text-error mt-2 mb-0", "role": "alert"}}
         cron_content = [self._col(
             "VCronField", "cron", "Cron 表达式", 12, placeholder="0 8 * * *",
             hint="北京时间 · 星期可填写 mon（周一）或 sun（周日）。",
-            **{"persistent-hint": True, "onUpdate:modelValue": edit_cron},
+            **{"persistent-hint": True},
         )]
         legacy_days = self._legacy_cron_weekdays()
         if legacy_days:
-            cron_content.append({"component": "VCol", "props": {
-                "cols": 12, "show": "{{model.cron_weekday_basis !== 'sunday_zero'}}",
+            cron_content.append({"component": "VCol", "show": "legacyCronDays", "props": {
+                "cols": 12,
                 "class": "text-caption text-medium-emphasis pt-0",
             }, "content": [{"component": "p", "text": f"旧规则当前按{legacy_days}执行。修改星期时，0 表示周日。"}]})
         return self._card("签到计划", "mdi-clock-outline", [
@@ -1129,134 +1154,59 @@ class NodeSeekV3(_PluginBase):
                 "model": "schedule_mode", "mandatory": True, "color": "primary", "variant": "outlined",
                 "rounded": "lg", "class": "w-100 h-auto mb-4", "aria-label": "计划模式",
             }, "content": [
-                {"component": "VBtn", "props": {
-                    "value": f"{{{{'{mode}'}}}}", "height": 44,
+                {"component": "VBtn", "bind": {"aria-pressed": f"{mode}Mode"}, "props": {
+                    "value": mode, "height": 44,
                     "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
-                    "type": "button", "aria-pressed": f"{{{{schedule_mode === '{mode}'}}}}",
+                    "type": "button",
                 }, "text": label}
                 for mode, label in (("window", "随机时段"), ("cron", "Cron 定时"))
             ]},
-            {"component": "VRow", "props": {"show": "{{schedule_mode === 'cron'}}"}, "content": cron_content},
-            {"component": "div", "props": {"show": "{{schedule_mode === 'window'}}"}, "content": [
+            {"component": "VRow", "show": "cronMode", "content": cron_content},
+            {"component": "div", "show": "windowMode", "content": [
                 {"component": "VRow", "props": {"dense": True}, "content": [
                     time_group("window_start", "开始时间"), time_group("window_end", "结束时间", error),
                 ]},
-                {"component": "p", "props": {
-                    "show": f"{{{{{valid}}}}}", "class": "text-caption text-medium-emphasis mt-3 mb-0",
-                    "textContent": f"{{{{'每天 ' + {start} + '–' + {end} + ' 随机签到一次 · 北京时间'}}}}",
-                }},
+                {"component": "p", "show": "windowSummary", "bind": {"textContent": "windowSummary"},
+                 "props": {"class": "text-caption text-medium-emphasis mt-3 mb-0"}},
             ]},
         ])
 
-    @staticmethod
-    def _form_login_state() -> str:
-        return f"model[Symbol.for({json.dumps(_VERIFY_STATE_KEY)})]"
-
-    @classmethod
-    def _invalidate_form_login(cls, field: str) -> str:
-        return f"""function(value) {{
-          if (model.{field} === value) return;
-          model.{field} = value;
-          {cls._form_login_state()} = {{}};
-          delete model.{_RECHECK_FIELD};
-          model.enabled = false;
-          model.onlyonce = false;
-        }}"""
-
-    def _verification_controls(self, cloud: bool) -> list[dict[str, Any]]:
-        state = self._form_login_state()
-        saved = json.dumps(self.get_state())
-        path = "cookiecloud_verify" if cloud else "manual_verify"
-        verify_path = json.dumps(f"plugin/{self.__class__.__name__}/{path}")
-        title = "验证 CookieCloud 登录" if cloud else "验证手动 Cookie"
-        cookie = "" if cloud else ", cookie: String(model.cookie || '').trim()"
-        verify_click = f"""async function() {{
-          if ({state}?.loading) return;
-          const keepEnabled = Boolean(model.enabled && ({state}?.keepEnabled ?? {state}?.ready ?? {saved}));
-          if (!keepEnabled) model.enabled = false;
-          {state} = {{loading: true, keepEnabled}};
-          const pending = {state};
-          delete model.{_RECHECK_FIELD};
-          model.onlyonce = false;
-          const options = {{use_proxy: model.use_proxy === true, user_agent: String(model.user_agent || '').trim(){cookie}}};
-          try {{
-            const result = await window.MoviePilotAPI.post(
-              {verify_path}, options, {{feedback: 'silent', timeout: 60000}});
-            if ({state} !== pending) return;
-            if (typeof result?.success !== 'boolean' || typeof result.message !== 'string') {{
-              throw new TypeError('Unexpected verification response');
-            }}
-            const lostLogin = result.status === 'signed_out';
-            if (lostLogin) model.enabled = false;
-            if (result.success) model.{_RECHECK_FIELD} = true;
-            const type = result.success ? 'success' :
-              ['signed_out', 'unknown', 'cookie_missing', 'manual_missing', 'manual_invalid', 'proxy_missing'].includes(result.status)
-                ? 'warning' : 'error';
-            {state} = {{ready: result.success, keepEnabled: keepEnabled && !lostLogin, type, message: result.message}};
-          }} catch (_) {{
-            if ({state} === pending) {{
-              {state} = {{keepEnabled, type: 'error', message: '未收到验证结果。请检查 MoviePilot 连接后重试。'}};
-            }}
-          }}
-        }}"""
-        initial_message = self._verification_message(self._login_failure, self._config) if self._login_failure else ""
-        message = f"({state} ? {state}.message : {json.dumps(initial_message)})"
-        return [
-            {"component": "VBtn", "props": {
-                "color": "primary", "variant": "tonal", "class": "text-none mt-3", "type": "button",
-                "prepend-icon": "mdi-shield-check-outline", "onclick": verify_click,
-                "loading": f"{{{{Boolean({state}?.loading)}}}}", "disabled": f"{{{{Boolean({state}?.loading)}}}}",
-                "aria-busy": f"{{{{Boolean({state}?.loading)}}}}",
-            }, "text": title},
-            {"component": "div", "props": {"role": "status", "aria-live": "polite"}, "content": [
-                {"component": "p", "props": {
-                    "show": f"{{{{Boolean({state}?.loading)}}}}", "class": "text-caption mt-2",
-                }, "text": "正在验证登录…"},
-                {"component": "VAlert", "props": {
-                    "show": f"{{{{Boolean({message})}}}}", "type": f"{{{{{state}?.type || 'warning'}}}}",
-                    "variant": "tonal", "density": "compact", "class": "mt-3",
-                }, "content": [
-                    {"component": "span", "props": {"textContent": f"{{{{{message} || ''}}}}"}},
-                ]},
-            ]},
-        ]
-
     def _account_form(self) -> dict[str, Any]:
         """呈现登录方式、验证结果和代理设置。"""
-        invalidate = self._invalidate_form_login
         return self._card("登录与网络", "mdi-shield-account-outline", [
             {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-2"}, "text": "登录方式"},
             {"component": "VBtnToggle", "props": {
                 "model": "cookiecloud", "mandatory": True, "color": "primary", "variant": "outlined",
-                "onUpdate:modelValue": invalidate("cookiecloud"),
                 "density": "comfortable", "rounded": "lg", "class": "w-100 h-auto flex-column flex-sm-row mb-4",
                 "aria-label": "登录方式",
             }, "content": [
-                {"component": "VBtn", "props": {
-                    "value": True, "prepend-icon": "mdi-cloud-outline", "height": 44,
-                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
-                    "type": "button", "aria-pressed": "{{cookiecloud}}",
-                }, "text": "CookieCloud"},
-                {"component": "VBtn", "props": {
-                    "value": False, "prepend-icon": "mdi-key-outline", "height": 44,
-                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
-                    "type": "button", "aria-pressed": "{{!cookiecloud}}",
-                }, "text": "手动 Cookie"},
+                {"component": "VBtn", "bind": {"aria-pressed": active}, "props": {
+                    "value": value, "prepend-icon": icon, "height": 44,
+                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium", "type": "button",
+                }, "text": label}
+                for value, icon, active, label in (
+                    (True, "mdi-cloud-outline", "useCloud", "CookieCloud"),
+                    (False, "mdi-key-outline", "useManual", "手动 Cookie"),
+                )
             ]},
-            {"component": "div", "props": {"show": "{{!cookiecloud}}", "class": "mb-4"}, "content": [
+            {"component": "div", "show": "useManual", "content": [
                 {"component": "VTextField", "props": {
                     "model": "cookie", "label": "NodeSeek Cookie", "type": "password", "autocomplete": "off",
-                    "onUpdate:modelValue": invalidate("cookie"),
                     "hide-details": True, "variant": "outlined",
                 }},
                 {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
                  "text": "粘贴已登录浏览器的 NodeSeek Cookie。Cookie 是登录凭据，请妥善保管。"},
-                *self._verification_controls(False),
             ]},
-            {"component": "div", "props": {"show": "{{cookiecloud}}", "class": "mb-4"}, "content": [
-                {"component": "p", "props": {"class": "text-body-2 text-medium-emphasis mb-0"},
-                 "text": "使用 MoviePilot 的 CookieCloud。"},
-                *self._verification_controls(True),
+            {"component": "p", "show": "useCloud", "props": {"class": "text-body-2 text-medium-emphasis mb-0"},
+             "text": "使用 MoviePilot 的 CookieCloud。"},
+            {"component": "VBtn", "action": "verifyLogin",
+             "bind": {"text": "verifyLabel", "loading": "verifying", "disabled": "busy"},
+             "props": {"color": "primary", "variant": "tonal", "class": "text-none mt-3", "type": "button",
+                       "prepend-icon": "mdi-shield-check-outline"}},
+            {"component": "div", "props": {"role": "status", "aria-live": "polite", "data-login-feedback": "",
+                                          "tabindex": -1, "class": "mb-4"}, "content": [
+                {"component": "VAlert", "show": "loginMessage", "bind": {"type": "loginAlertType", "text": "loginMessage"},
+                 "props": {"variant": "tonal", "density": "compact", "class": "mt-3"}},
             ]},
             {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
                 {"component": "VExpansionPanel", "props": {"elevation": 0, "class": "border rounded-lg"}, "content": [
@@ -1264,20 +1214,16 @@ class NodeSeekV3(_PluginBase):
                         {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
                          "text": "mdi-lan-connect"},
                         {"component": "span", "props": {"class": "font-weight-medium"}, "text": "代理与 User-Agent"},
-                        {"component": "VChip", "props": {"size": "small", "variant": "tonal", "class": "ml-3"},
-                         "content": [{"component": "span", "props": {
-                             "textContent": "{{use_proxy ? '使用系统代理' : '直连'}}",
-                         }}]},
+                        {"component": "VChip", "bind": {"text": "proxyLabel"},
+                         "props": {"size": "small", "variant": "tonal", "class": "ml-3"}},
                     ]},
                     {"component": "VExpansionPanelText", "content": [
                         {"component": "VSwitch", "props": {
                             "model": "use_proxy", "label": "使用 MoviePilot 系统代理", "color": "primary",
-                            "onUpdate:modelValue": invalidate("use_proxy"),
                             "hide-details": True,
                         }},
                         {"component": "VTextField", "props": {
                             "model": "user_agent", "label": "浏览器 User-Agent", "variant": "outlined",
-                            "onUpdate:modelValue": invalidate("user_agent"),
                             "hint": "可选。留空使用宿主浏览器的默认值。", "persistent-hint": True,
                             "maxlength": 1024, "class": "mt-2",
                         }},
@@ -1287,21 +1233,18 @@ class NodeSeekV3(_PluginBase):
         ])
 
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
-        """返回分组的 Vuetify JSON 配置表单，兼容既有模型。"""
+        """返回配置页布局、初始登录状态与兼容既有设置的默认值。"""
         col = self._col
-        state = self._form_login_state()
-        saved = json.dumps(self.get_state())
-        ready = f"({state} ? {state}.ready === true : {saved})"
-        enabled = f"(model.enabled === true && ({ready} || {state}?.keepEnabled === true))"
-        row = lambda fields: {"component": "VRow", "content": fields}
-        basic = self._card("签到设置", "mdi-calendar-check", [row([
-            col("VSwitch", "enabled", "启用定时签到", 6, color="primary",
-                modelValue=f"{{{{{enabled}}}}}", disabled=f"{{{{!{enabled} && !{ready}}}}}"),
-            col("VSwitch", "onlyonce", "保存后立即签到一次", 6, color="success", disabled=f"{{{{!{ready}}}}}"),
-            col("VSwitch", "random", "随机奖励（关闭为固定奖励）", 6, color="primary"),
-            col("VSwitch", "notify", "发送签到通知", 6, color="primary"),
-        ]), {"component": "p", "props": {"show": f"{{{{!{ready}}}}}", "class": "text-caption text-medium-emphasis mb-0"},
-             "text": "请先在「登录与网络」验证当前登录方式。"}])
+        basic = self._card("签到设置", "mdi-calendar-check", [
+            {"component": "VRow", "content": [
+                col("VSwitch", "enabled", "启用定时签到", 6, color="primary"),
+                col("VSwitch", "onlyonce", "保存后立即签到一次", 6, color="success"),
+                col("VSwitch", "random", "随机奖励（关闭为固定奖励）", 6, color="primary"),
+                col("VSwitch", "notify", "发送签到通知", 6, color="primary"),
+            ]},
+            {"component": "p", "show": "needsLogin", "props": {"class": "text-caption text-medium-emphasis mb-0"},
+             "text": "保存时会验证当前登录方式。"},
+        ])
         defaults = dict(self._defaults)
         for key in ("window_start", "window_end"):
             value = self._window_value(self._config, key)
@@ -1310,7 +1253,13 @@ class NodeSeekV3(_PluginBase):
             else:
                 defaults[f"{key}_hour"] = None
                 defaults[f"{key}_minute"] = None
-        return [{"component": "VForm", "content": [basic, self._schedule_form(), self._account_form()]}], defaults
+        notice = self._verification_message(self._login_failure, self._config) if self._login_failure else ""
+        return [{
+            "component": "VForm",
+            "enabled": self.get_state(),
+            "login_notice": notice,
+            "content": [basic, self._schedule_form(), self._account_form()],
+        }], defaults
 
     def _schedule_overview(self, now: datetime) -> ScheduleOverview:
         """读取实际登记的签到任务，避免页面访问影响随机计划。"""

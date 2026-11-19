@@ -1,0 +1,14 @@
+{
+  "name": "nodeseekv3-moviepilot-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "devDependencies": {
+    "@originjs/vite-plugin-federation": "1.4.1",
+    "@vitejs/plugin-vue": "5.2.4",
+    "vite": "5.4.21",
+    "vue": "3.5.44"
+  }
+}

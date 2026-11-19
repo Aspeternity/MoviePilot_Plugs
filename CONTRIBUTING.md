@@ -1,6 +1,6 @@
 # 开发说明
 
-本仓库只保存插件源码。插件实际运行在 MoviePilot V3 的 Python 进程中。
+本仓库保存插件源码和 MoviePilot 加载的前端构建产物。签到逻辑运行在 MoviePilot V3 的 Python 进程中。
 
 ## 本地检查
 
@@ -23,6 +23,9 @@ git diff --check
 还需在实际使用版本的 MoviePilot 中检查插件加载、停止与重载。
 
 ## 修改与发布
+
+修改配置页或签到数据页的 Vue 组件后，在 `frontend/nodeseekv3/` 运行 `npm ci` 和 `npm run build`。
+提交组件源码和生成的 `plugins.v3/nodeseekv3/dist/assets/`，使 MoviePilot 可以直接加载插件页面。
 
 1. 修改 `plugins.v3/nodeseekv3/` 下的源码，按需要维护 `tests/`。
 2. 运行离线检查，并在 MoviePilot 中验证实际行为。
