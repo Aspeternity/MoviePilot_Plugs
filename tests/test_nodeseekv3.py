@@ -74,7 +74,7 @@ def plugin_module(monkeypatch):
     module("app.sdk.logging", logger=fake_logger)
     module("app.sdk.plugin", _PluginBase=FakeBase)
     module("app.sdk.scheduler", add_plugin_once_job=lambda *args, **kwargs: True,
-           remove_plugin_once_job=lambda *args: None)
+           list_scheduler_jobs=lambda: [], remove_plugin_once_job=lambda *args: None)
     module("app.sdk.security", verify_token=lambda: None)
     module("app.schemas", TokenPayload=types.SimpleNamespace)
     module("app.schemas.types", MessageType=types.SimpleNamespace(SiteMessage="site"))
@@ -526,7 +526,7 @@ def test_once_and_overlap(plugin_module, monkeypatch):
 
 def test_window_trigger_boundaries_and_restarts(plugin_module, monkeypatch):
     """验证时段边界、稳定抽样、日切换及重启时剩余窗口。"""
-    monkeypatch.setattr(plugin_module.random, "uniform", lambda low, high: high / 2)
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count // 2)
     trigger = plugin_module.RandomWindowTrigger("08:00", "10:00")
     tz = timezone(timedelta(hours=8))
     before = datetime(2026, 11, 18, 7, 0, tzinfo=tz)
@@ -540,13 +540,20 @@ def test_window_trigger_boundaries_and_restarts(plugin_module, monkeypatch):
     late = datetime(2026, 11, 18, 10, 1, tzinfo=tz)
     assert plugin_module.RandomWindowTrigger("08:00", "10:00").get_next_fire_time(None, late) == \
         datetime(2026, 11, 19, 9, 0, tzinfo=tz)
+    at_end = datetime(2026, 11, 18, 10, 0, tzinfo=tz)
+    assert plugin_module.RandomWindowTrigger("08:00", "10:00").get_next_fire_time(None, at_end) == \
+        datetime(2026, 11, 19, 9, 0, tzinfo=tz)
+
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count - 1)
+    assert plugin_module.RandomWindowTrigger("08:00", "10:00").get_next_fire_time(None, mid) == \
+        at_end - timedelta.resolution
 
 
 def test_window_trigger_real_apscheduler_processing(plugin_module, monkeypatch):
     """模拟 APScheduler 的到期扫描和二次 next-fire 计算，确保不会跳过一天。"""
     from apscheduler.schedulers.background import BackgroundScheduler
 
-    monkeypatch.setattr(plugin_module.random, "uniform", lambda low, high: high / 2)
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count // 2)
     tz = timezone(timedelta(hours=8))
     start = datetime(2026, 11, 18, 7, 0, tzinfo=tz)
     trigger = plugin_module.RandomWindowTrigger("08:00", "10:00")
@@ -559,11 +566,87 @@ def test_window_trigger_real_apscheduler_processing(plugin_module, monkeypatch):
 
 def test_window_pending_time_stays_in_window_when_late(plugin_module, monkeypatch):
     """调度器延迟时保持已抽取时间，交由宿主判定失火策略。"""
-    monkeypatch.setattr(plugin_module.random, "uniform", lambda low, high: high / 2)
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count // 2)
     tz = timezone(timedelta(hours=8))
     trigger = plugin_module.RandomWindowTrigger("08:00", "10:00")
     first = trigger.get_next_fire_time(None, datetime(2026, 11, 18, 7, 0, tzinfo=tz))
     assert trigger.get_next_fire_time(None, datetime(2026, 11, 18, 11, 0, tzinfo=tz)) == first
+
+
+def test_random_window_restores_future_time_and_replaces_stale_or_changed_plan(plugin_module, monkeypatch):
+    tz = timezone(timedelta(hours=8))
+    day = datetime(2026, 11, 18, tzinfo=tz)
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count // 2)
+    settings = {"enabled": True, "cookie": "session=example", "schedule_mode": "window"}
+    plugin = plugin_module.NodeSeekV3()
+    plugin.init_plugin(settings)
+    first = plugin.get_service()[0]["trigger"].get_next_fire_time(None, day.replace(hour=7))
+    assert first == day.replace(hour=9)
+
+    reopened = plugin_module.NodeSeekV3()
+    reopened.data = plugin.data.copy()
+    reopened.init_plugin(settings)
+    assert reopened.get_service()[0]["trigger"].get_next_fire_time(None, day.replace(hour=8, minute=30)) == first
+
+    now = day.replace(hour=9, minute=30)
+    assert reopened.get_service()[0]["trigger"].get_next_fire_time(None, now) == day.replace(hour=9, minute=45)
+    reopened.init_plugin({**settings, "window_end": "09:00"})
+    assert reopened.get_service()[0]["trigger"].get_next_fire_time(None, day.replace(hour=8)) == \
+        day.replace(hour=8, minute=30)
+
+
+@pytest.mark.parametrize("day_offset, execution_time, expected", [
+    (0, "09:30", True), (0, "10:00", False), (0, "10:30", False), (1, "09:00", False),
+])
+def test_scheduled_window_checks_delivery_time(plugin_module, monkeypatch, day_offset, execution_time, expected):
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    day = datetime(2026, 11, 18, tzinfo=plugin_module._BEIJING)
+    hour, minute = map(int, execution_time.split(":"))
+    now = day.replace(hour=hour, minute=minute) + timedelta(days=day_offset)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(plugin_module, "datetime", Clock)
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda count: count // 2)
+    plugin = plugin_module.NodeSeekV3()
+    settings = {"enabled": True, "cookie": "session=example", "schedule_mode": "window"}
+    plugin.init_plugin(settings)
+    calls = []
+    monkeypatch.setattr(plugin, "sign", lambda: calls.append("sign"))
+    service = plugin.get_service()[0]
+    trigger = service["trigger"]
+    first = trigger.get_next_fire_time(None, day.replace(hour=7))
+    clock = BackgroundScheduler(timezone=plugin_module._BEIJING)
+    job = clock.add_job(service["func"], trigger=trigger, next_run_time=first)
+    assert job._get_run_times(now) == [day.replace(hour=9)]
+    service["func"]()
+    service["func"]()
+    assert calls == (["sign"] if expected else [])
+    if expected:
+        reopened = plugin_module.NodeSeekV3()
+        reopened.data = plugin.data.copy()
+        reopened.init_plugin(settings)
+        assert reopened.get_service()[0]["trigger"].get_next_fire_time(None, now) == day.replace(hour=9) + timedelta(days=1)
+
+
+def test_weekday_basis_preserves_legacy_and_aligns_new_cron_with_editor(plugin_module):
+    plugin = plugin_module.NodeSeekV3()
+    sunday = datetime(2026, 11, 22, tzinfo=plugin_module._BEIJING)
+    config = {"enabled": True, "cookie": "session=example", "cron": "0 8 * * 0"}
+    plugin.init_plugin(config)
+    assert plugin.get_service()[0]["trigger"].get_next_fire_time(None, sunday).weekday() == 0
+    form, _ = plugin.get_form()
+    assert "旧规则当前按周一执行" in json.dumps(form, ensure_ascii=False)
+
+    for field in ("0", "7", "sun", "5-7", "0-6/2"):
+        plugin.init_plugin({**config, "cron": f"0 8 * * {field}", "cron_weekday_basis": "sunday_zero"})
+        assert plugin.get_service()[0]["trigger"].get_next_fire_time(None, sunday) == sunday.replace(hour=8)
+    plugin.init_plugin({**config, "cron": "0 8 * * 6", "cron_weekday_basis": "sunday_zero"})
+    assert plugin.get_service()[0]["trigger"].get_next_fire_time(None, sunday).weekday() == 5
 
 
 @pytest.mark.parametrize("start,end", [("8:00", "10:00"), ("12:60", "13:00"),
@@ -618,17 +701,34 @@ def test_form_conditional_time_selection(plugin_module):
     plugin = plugin_module.NodeSeekV3()
     form, _ = plugin.get_form()
     schedule = form[0]["content"][1]["content"][2]["content"]
-    assert schedule[0]["content"][0]["content"][0]["props"]["items"][0]["title"] == "Cron 定时签到"
-    assert schedule[1]["props"]["show"] == "{{schedule_mode == 'cron'}}"
-    assert schedule[2]["props"]["show"] == "{{schedule_mode == 'window'}}"
-    assert schedule[3]["props"]["class"] == "mt-3"
-    assert schedule[3]["props"]["show"] == "{{schedule_mode == 'window'}}"
-    for index, col in enumerate(schedule[2]["content"]):
-        field = col["content"][0]
-        assert field["component"] == "VSelect"
-        assert len(field["props"]["items"]) == (24 if index % 2 == 0 else 60)
-        assert field["props"]["items"][0] == "00"
-        assert field["props"]["items"][-1] == ("23" if index % 2 == 0 else "59")
+    assert [(node["text"], node["props"]["value"]) for node in schedule[0]["content"]] == [
+        ("随机时段", "{{'window'}}"), ("Cron 定时", "{{'cron'}}"),
+    ]
+    assert schedule[1]["props"]["show"] == "{{schedule_mode === 'cron'}}"
+    assert schedule[2]["props"]["show"] == "{{schedule_mode === 'window'}}"
+    for group, label in zip(schedule[2]["content"][0]["content"], ("开始时间", "结束时间"), strict=True):
+        assert group["content"][0]["text"] == label
+        for col, count in zip(group["content"][1]["content"], (24, 60), strict=True):
+            field = col["content"][0]
+            assert field["component"] == "VSelect"
+            assert field["props"]["items"] == [f"{value:02d}" for value in range(count)]
+
+
+def test_schedule_overview_reads_registered_job_without_drawing(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    plugin.init_plugin({"enabled": True, "schedule_mode": "window"})
+    monkeypatch.setattr(plugin_module.random, "randrange", lambda *_: pytest.fail("概览不能抽取随机时间"))
+    monkeypatch.setattr(plugin_module, "list_scheduler_jobs", lambda: [
+        types.SimpleNamespace(id="NodeSeekV3_NodeSeekV3CookieCloud", next_run="5 分钟", status="等待"),
+        types.SimpleNamespace(id="NodeSeekV3_NodeSeekV3", next_run="1 小时", status="等待"),
+    ])
+    overview = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "下次执行：1 小时" in overview and "5 分钟" not in overview
+    assert plugin.data == {}
+
+    plugin.init_plugin({"enabled": True, "schedule_mode": "window", "window_start": "10:00", "window_end": "08:00"})
+    overview = json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert "计划无效" in overview and "下次执行" not in overview
 
 
 @pytest.mark.parametrize("value,message,expected", [(0, "", 0), ("7", "", 7),

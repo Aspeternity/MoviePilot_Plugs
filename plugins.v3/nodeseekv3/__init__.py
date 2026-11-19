@@ -1,6 +1,8 @@
 """基于 MoviePilot V3 浏览器能力的 NodeSeek 每日签到插件。"""
 
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
+from functools import partial
 from http.cookies import CookieError, SimpleCookie
 import json
 import random
@@ -20,7 +22,7 @@ from app.sdk.browser import launch_browser_context
 from app.sdk.config import settings
 from app.sdk.logging import logger
 from app.sdk.plugin import _PluginBase
-from app.sdk.scheduler import add_plugin_once_job, remove_plugin_once_job
+from app.sdk.scheduler import add_plugin_once_job, list_scheduler_jobs, remove_plugin_once_job
 from app.sdk.security import verify_token
 from app import schemas
 from app.schemas.types import MessageType
@@ -31,6 +33,13 @@ _SITE_HOST = urlsplit(_BASE_URL).netloc
 _BEIJING = timezone(timedelta(hours=8))
 _VERIFY_STATE_KEY = "nodeseek:cookiecloud-verification"
 _CHALLENGE_TITLES = ("just a moment", "attention required", "请稍候")
+_TIME_PATTERN = r"(?:[01]\d|2[0-3]):[0-5]\d"
+_SIGN_SERVICE_ID = "NodeSeekV3"
+_WINDOW_PLAN_KEY = "random_window_next_run"
+_WINDOW_ATTEMPT_KEY = "random_window_last_attempt"
+_CRONTAB_WEEKDAYS = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+_WEEKDAY_LABELS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+_WEEKDAY_BASIS = "sunday_zero"
 
 _LOGIN_SCRIPT = r"""async () => {
   const readUser = config => {
@@ -148,45 +157,103 @@ async (random) => {
 """
 
 
+def _cron_weekdays(field: str) -> str:
+    """将表单使用的星期编号转换为 APScheduler 支持的星期名。"""
+    if field == "*":
+        return field
+    indices = {name: index for index, name in enumerate(_CRONTAB_WEEKDAYS)}
+    indices.update({str(index): index for index in range(8)})
+    days = set()
+    for segment in field.lower().split(","):
+        selection, slash, step = segment.partition("/")
+        if slash and not re.fullmatch(r"[1-7]", step):
+            raise ValueError("星期步长须为 1 到 7")
+        if selection == "*":
+            first, last = 0, 6
+        else:
+            begin, dash, finish = selection.partition("-")
+            if begin not in indices or (dash and finish not in indices) or (slash and not dash):
+                raise ValueError("Cron 星期格式无效")
+            first = indices[begin]
+            last = indices[finish] if dash else first
+            if dash and finish == "sun" and first > 0:
+                last = 7
+            if first > last:
+                raise ValueError("Cron 星期范围应按起始日到结束日排列")
+        for day in range(first, last + 1, int(step) if slash else 1):
+            days.add(day % 7)
+    return ",".join(_CRONTAB_WEEKDAYS[day] for day in sorted(days))
+
+
 class RandomWindowTrigger(BaseTrigger):
     """每天在指定的北京时间窗口内随机触发一次。"""
 
-    def __init__(self, start: str, end: str) -> None:
+    def __init__(
+        self,
+        start: str,
+        end: str,
+        *,
+        restored: datetime | None = None,
+        last_attempt: date | None = None,
+        on_plan: Callable[[datetime], None] | None = None,
+    ) -> None:
         """解析同一天内的起止时间，结束时间以分钟为最小单位。"""
         self.start = self._parse_time(start)
         self.end = self._parse_time(end)
         if self.start >= self.end:
             raise ValueError("开始时间必须早于结束时间，暂不支持跨午夜时段")
-        self._pending = None
+        self._pending: datetime | None = None
+        self._last_due: datetime | None = None
+        self._restored = restored
+        self._last_attempt = last_attempt
+        self._on_plan = on_plan
 
     @staticmethod
     def _parse_time(value: str) -> int:
         """将严格的 HH:MM 转换为自午夜起的秒数。"""
-        if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        if not isinstance(value, str) or not re.fullmatch(_TIME_PATTERN, value):
             raise ValueError("时间必须使用 00:00 至 23:59 的 HH:MM 格式")
         hour, minute = map(int, value.split(":"))
         return (hour * 60 + minute) * 60
 
-    def get_next_fire_time(self, previous_fire_time: datetime, now: datetime) -> datetime:
-        """保持当天已抽取的时间稳定，并在下一天重新抽取。"""
+    def _bounds(self, day: date) -> tuple[datetime, datetime]:
+        midnight = datetime(day.year, day.month, day.day, tzinfo=_BEIJING)
+        return midnight + timedelta(seconds=self.start), midnight + timedelta(seconds=self.end)
+
+    def is_due(self, now: datetime) -> bool:
+        """只接收今天已交付的任务，并在结束时间前执行。"""
+        now = now.astimezone(_BEIJING)
+        start, end = self._bounds(now.date())
+        return self._last_due is not None and start <= self._last_due <= now < end
+
+    def get_next_fire_time(self, previous_fire_time: datetime | None, now: datetime) -> datetime:
+        """恢复仍有效的计划，并兼容 APScheduler 对同一次触发的重复查询。"""
         now = now.astimezone(_BEIJING)
         if previous_fire_time is not None:
             previous_fire_time = previous_fire_time.astimezone(_BEIJING)
+            if previous_fire_time <= now and (self._last_due is None or previous_fire_time > self._last_due):
+                self._last_due = previous_fire_time
         if self._pending is not None:
             if previous_fire_time is None or previous_fire_time < self._pending:
                 return self._pending
-            self._pending = None
         day = now.date()
         if previous_fire_time is not None and previous_fire_time.date() >= day:
             day = previous_fire_time.date() + timedelta(days=1)
-        midnight = datetime(day.year, day.month, day.day, tzinfo=_BEIJING)
-        start = midnight + timedelta(seconds=self.start)
-        end = midnight + timedelta(seconds=self.end)
-        if now > end:
-            start += timedelta(days=1)
-            end += timedelta(days=1)
+        if self._last_attempt == day:
+            day += timedelta(days=1)
+        start, end = self._bounds(day)
+        if now >= end:
+            start, end = self._bounds(day + timedelta(days=1))
         lower = max(now, start)
-        self._pending = lower + timedelta(seconds=random.uniform(0, (end - lower).total_seconds()))
+        restored, self._restored = self._restored, None
+        if restored is not None and lower <= restored < end:
+            self._pending = restored
+        else:
+            # randrange 取不到上界，即使抽中最后一微秒也仍处在时段内。
+            microseconds = (end - lower) // timedelta.resolution
+            self._pending = lower + timedelta(microseconds=random.randrange(microseconds))
+            if self._on_plan is not None:
+                self._on_plan(self._pending)
         return self._pending
 
     def __str__(self) -> str:
@@ -219,6 +286,7 @@ class NodeSeekV3(_PluginBase):
         super().__init__()
         self._config = dict(self._defaults)
         self._lock = threading.Lock()
+        self._window_attempt_lock = threading.Lock()
 
     @staticmethod
     def _selected_window(config: dict[str, Any], key: str) -> str | None:
@@ -228,6 +296,11 @@ class NodeSeekV3(_PluginBase):
             return None
         return f"{hour if hour is not None else ''}:{minute if minute is not None else ''}"
 
+    @classmethod
+    def _window_value(cls, config: dict[str, Any], key: str) -> Any:
+        selected = cls._selected_window(config, key)
+        return selected if selected is not None else config.get(key)
+
     def init_plugin(self, config: dict = None) -> None:
         """读取配置并按需向宿主调度器提交一次性签到。"""
         self.stop_service()
@@ -235,9 +308,7 @@ class NodeSeekV3(_PluginBase):
         self._config.pop("_nodeseek_cloud_fetching", None)
         self._config.pop("_nodeseek_cloud_verifying", None)
         for key in ("window_start", "window_end"):
-            selected = self._selected_window(self._config, key)
-            if selected is not None:
-                self._config[key] = selected
+            self._config[key] = self._window_value(self._config, key)
         if self._config.get("onlyonce"):
             self._config["onlyonce"] = False
             self.update_config(self._config)
@@ -356,6 +427,66 @@ class NodeSeekV3(_PluginBase):
             except Exception:
                 logger.warning("NodeSeek 浏览器上下文关闭失败")
 
+    def _schedule_trigger(self, *, register: bool = False) -> CronTrigger | RandomWindowTrigger:
+        """用同一套配置规则生成触发器，只有注册随机计划时才读写恢复状态。"""
+        mode = self._config.get("schedule_mode", "cron")
+        if mode == "window":
+            start = self._window_value(self._config, "window_start")
+            end = self._window_value(self._config, "window_end")
+            if not register:
+                return RandomWindowTrigger(start, end)
+            return RandomWindowTrigger(
+                start,
+                end,
+                restored=self._restore_window_time(start, end),
+                last_attempt=self._window_attempt_date(),
+                on_plan=partial(self._store_window_time, start, end),
+            )
+        if mode == "cron":
+            expression = str(self._config.get("cron") or "").strip()
+            if self._config.get("cron_weekday_basis") == _WEEKDAY_BASIS:
+                fields = expression.split()
+                if len(fields) != 5:
+                    raise ValueError("Cron 表达式须包含五段")
+                fields[-1] = _cron_weekdays(fields[-1])
+                expression = " ".join(fields)
+            return CronTrigger.from_crontab(expression, timezone=_BEIJING)
+        raise ValueError("未知的签到计划模式")
+
+    def _restore_window_time(self, start: str, end: str) -> datetime | None:
+        saved = self.get_data(_WINDOW_PLAN_KEY)
+        if not isinstance(saved, dict) or saved.get("start") != start or saved.get("end") != end:
+            return None
+        try:
+            scheduled = datetime.fromisoformat(saved.get("at", ""))
+            return scheduled.astimezone(_BEIJING) if scheduled.tzinfo is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _store_window_time(self, start: str, end: str, scheduled: datetime) -> None:
+        try:
+            self.save_data(_WINDOW_PLAN_KEY, {"start": start, "end": end, "at": scheduled.isoformat()})
+        except Exception:
+            logger.warning("NodeSeek 无法保存随机签到时间")
+
+    def _window_attempt_date(self) -> date | None:
+        try:
+            return date.fromisoformat(self.get_data(_WINDOW_ATTEMPT_KEY) or "")
+        except (TypeError, ValueError):
+            return None
+
+    def _run_window_sign(self, trigger: RandomWindowTrigger) -> None:
+        """限制随机任务执行时间，手动发起的签到仍使用 sign。"""
+        with self._window_attempt_lock:
+            now = datetime.now(_BEIJING)
+            if not trigger.is_due(now):
+                logger.info("NodeSeek 随机签到已错过计划时段，本次跳过")
+                return
+            if self._window_attempt_date() == now.date():
+                return
+            self.save_data(_WINDOW_ATTEMPT_KEY, now.date().isoformat())
+        self.sign()
+
     def get_service(self) -> list[dict[str, Any]]:
         """按配置注册签到及独立的 CookieCloud 同步任务。"""
         services = []
@@ -373,22 +504,13 @@ class NodeSeekV3(_PluginBase):
                 logger.error("NodeSeek 手动模式缺少有效 Cookie，不注册签到任务")
             return services
         try:
-            mode = self._config.get("schedule_mode", "cron")
-            if mode == "window":
-                start = self._selected_window(self._config, "window_start")
-                end = self._selected_window(self._config, "window_end")
-                trigger = RandomWindowTrigger(start if start is not None else self._config.get("window_start"),
-                                              end if end is not None else self._config.get("window_end"))
-            elif mode == "cron":
-                trigger = CronTrigger.from_crontab(str(self._config.get("cron") or ""),
-                                                   timezone=_BEIJING)
-            else:
-                raise ValueError("未知的签到计划模式")
+            trigger = self._schedule_trigger(register=True)
         except ValueError:
             logger.error("NodeSeek 签到计划无效，请检查 Cron 或随机时段设置")
             return services
-        services.insert(0, {"id": "NodeSeekV3", "name": "NodeSeek 论坛签到",
-                            "trigger": trigger, "func": self.sign, "kwargs": {}})
+        action = partial(self._run_window_sign, trigger) if isinstance(trigger, RandomWindowTrigger) else self.sign
+        services.insert(0, {"id": _SIGN_SERVICE_ID, "name": "NodeSeek 论坛签到",
+                            "trigger": trigger, "func": action, "kwargs": {}})
         return services
 
     def sync_cookiecloud(self) -> None:
@@ -600,6 +722,101 @@ class NodeSeekV3(_PluginBase):
         last = self.get_data("last_result")
         return [dict(last)] if isinstance(last, dict) and last else []
 
+    def _legacy_cron_weekdays(self) -> str:
+        """显示现有数字星期真正匹配的日期，避免用编辑器的编号猜测。"""
+        expression = str(self._config.get("cron") or "").split()
+        if self._config.get("cron_weekday_basis") == _WEEKDAY_BASIS or len(expression) != 5:
+            return ""
+        weekdays = expression[-1]
+        if not re.search(r"\d", weekdays):
+            return ""
+        try:
+            trigger = CronTrigger(day_of_week=weekdays, hour=0, minute=0, timezone=_BEIJING)
+            monday = datetime(2024, 1, 1, tzinfo=_BEIJING)
+            labels = []
+            for offset, label in enumerate(_WEEKDAY_LABELS):
+                day = monday + timedelta(days=offset)
+                if trigger.get_next_fire_time(None, day) == day:
+                    labels.append(label)
+            return "、".join(labels)
+        except ValueError:
+            return ""
+
+    def _schedule_form(self) -> dict[str, Any]:
+        """生成计划模式、分组时间输入及随输入更新的摘要。"""
+        def time_group(key: str, label: str, error: dict | None = None) -> dict:
+            fields = []
+            for part, name, count in (("hour", "小时", 24), ("minute", "分钟", 60)):
+                fields.append({"component": "VCol", "props": {"cols": 6}, "content": [
+                    {"component": "VSelect", "props": {
+                        "model": f"{key}_{part}", "label": name, "aria-label": f"{label}{name}",
+                        "items": [f"{value:02d}" for value in range(count)], "hide-details": True,
+                    }},
+                ]})
+            children = [
+                {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-2"}, "text": label},
+                {"component": "VRow", "props": {"dense": True}, "content": fields},
+            ]
+            if error is not None:
+                children.append(error)
+            return {"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": children}
+
+        def time_text(key: str) -> str:
+            return f"(String(model.{key}_hour ?? '') + ':' + String(model.{key}_minute ?? ''))"
+
+        start, end = time_text("window_start"), time_text("window_end")
+        complete = f"(/^{_TIME_PATTERN}$/.test({start}) && /^{_TIME_PATTERN}$/.test({end}))"
+        valid = f"({complete} && {start} < {end})"
+        error = {"component": "p", "props": {
+            "show": f"{{{{!{valid}}}}}", "class": "text-caption text-error mt-2 mb-0",
+            "role": "alert", "textContent": (
+                f"{{{{{complete} ? '结束时间须晚于开始时间，且在同一天。' : '请选择完整的开始和结束时间。'}}}}"
+            ),
+        }}
+        # MoviePilot 的 Cron 输入和可视编辑器共用更新事件。只有实际改动星期才切换编号方式。
+        edit_cron = r"""function(value) {
+          const previous = String(model.cron ?? '').trim().split(/\s+/);
+          const next = String(value ?? '').trim().split(/\s+/);
+          if (next.length === 5 && (previous.length !== 5 || previous[4].toLowerCase() !== next[4].toLowerCase())) {
+            model.cron_weekday_basis = 'sunday_zero';
+          }
+          model.cron = value;
+        }"""
+        cron_content = [self._col(
+            "VCronField", "cron", "Cron 表达式", 12, placeholder="0 8 * * *",
+            hint="北京时间 · 星期可填写 mon（周一）或 sun（周日）。",
+            **{"persistent-hint": True, "onUpdate:modelValue": edit_cron},
+        )]
+        legacy_days = self._legacy_cron_weekdays()
+        if legacy_days:
+            cron_content.append({"component": "VCol", "props": {
+                "cols": 12, "show": "{{model.cron_weekday_basis !== 'sunday_zero'}}",
+                "class": "text-caption text-medium-emphasis pt-0",
+            }, "content": [{"component": "p", "text": f"旧规则当前按{legacy_days}执行。修改星期时，0 表示周日。"}]})
+        return self._card("签到计划", "mdi-clock-outline", [
+            {"component": "VBtnToggle", "props": {
+                "model": "schedule_mode", "mandatory": True, "color": "primary", "variant": "outlined",
+                "rounded": "lg", "class": "w-100 h-auto mb-4", "aria-label": "计划模式",
+            }, "content": [
+                {"component": "VBtn", "props": {
+                    "value": f"{{{{'{mode}'}}}}", "height": 44,
+                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
+                    "type": "button", "aria-pressed": f"{{{{schedule_mode === '{mode}'}}}}",
+                }, "text": label}
+                for mode, label in (("window", "随机时段"), ("cron", "Cron 定时"))
+            ]},
+            {"component": "VRow", "props": {"show": "{{schedule_mode === 'cron'}}"}, "content": cron_content},
+            {"component": "div", "props": {"show": "{{schedule_mode === 'window'}}"}, "content": [
+                {"component": "VRow", "props": {"dense": True}, "content": [
+                    time_group("window_start", "开始时间"), time_group("window_end", "结束时间", error),
+                ]},
+                {"component": "p", "props": {
+                    "show": f"{{{{{valid}}}}}", "class": "text-caption text-medium-emphasis mt-3 mb-0",
+                    "textContent": f"{{{{'每天 ' + {start} + '–' + {end} + ' 随机签到一次 · 北京时间'}}}}",
+                }},
+            ]},
+        ])
+
     def _account_form(self) -> dict[str, Any]:
         """呈现登录方式、实时验证结果和可折叠的网络与浏览器设置。"""
         verify_path = json.dumps(f"plugin/{self.__class__.__name__}/cookiecloud_verify")
@@ -714,38 +931,40 @@ class NodeSeekV3(_PluginBase):
             col("VSwitch", "random", "随机奖励（关闭为固定奖励）", 6, color="primary"),
             col("VSwitch", "notify", "发送签到通知", 6, color="primary"),
         ])])
-        schedule = self._card("签到计划", "mdi-clock-outline", [
-            row([col("VSelect", "schedule_mode", "计划模式", 12, items=[
-                {"title": "Cron 定时签到", "value": "cron"},
-                {"title": "指定时段随机签到", "value": "window"}])]),
-            {"component": "VRow", "props": {"show": "{{schedule_mode == 'cron'}}"},
-             "content": [col("VCronField", "cron", "Cron 签到周期", 12, placeholder="0 8 * * *")]},
-            {"component": "VRow", "props": {"show": "{{schedule_mode == 'window'}}"},
-             "content": [col("VSelect", "window_start_hour", "开始小时", 3,
-                             items=[f"{hour:02d}" for hour in range(24)]),
-                         col("VSelect", "window_start_minute", "开始分钟", 3,
-                             items=[f"{minute:02d}" for minute in range(60)]),
-                         col("VSelect", "window_end_hour", "结束小时", 3,
-                             items=[f"{hour:02d}" for hour in range(24)]),
-                         col("VSelect", "window_end_minute", "结束分钟", 3,
-                             items=[f"{minute:02d}" for minute in range(60)])]},
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mt-3", "show": "{{schedule_mode == 'window'}}",
-             "text": "随机时段仅支持同一天内的 HH:MM，开始必须早于结束；重启时在剩余时段内重新抽取，错过时段则等待次日。"}},
-        ])
         defaults = dict(self._defaults)
         for key in ("window_start", "window_end"):
-            value = self._config.get(key)
-            if isinstance(value, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            value = self._window_value(self._config, key)
+            if isinstance(value, str) and re.fullmatch(_TIME_PATTERN, value):
                 defaults[f"{key}_hour"], defaults[f"{key}_minute"] = value.split(":")
             else:
                 defaults[f"{key}_hour"] = None
                 defaults[f"{key}_minute"] = None
-        return [{"component": "VForm", "content": [basic, schedule, self._account_form()]}], defaults
+        return [{"component": "VForm", "content": [basic, self._schedule_form(), self._account_form()]}], defaults
+
+    def _schedule_overview(self) -> tuple[str, str]:
+        """读取实际登记的签到任务，避免页面访问影响随机计划。"""
+        if not self.get_state():
+            return "自动签到已关闭", ""
+        try:
+            self._schedule_trigger()
+        except ValueError:
+            return "计划无效", "请检查签到计划中的时间或 Cron 表达式。"
+        job_id = f"{self.__class__.__name__}_{_SIGN_SERVICE_ID}"
+        try:
+            job = next((item for item in list_scheduler_jobs() if item.id == job_id), None)
+        except Exception:
+            logger.warning("NodeSeek 无法读取已登记的签到任务")
+            return "自动签到已开启", "暂时无法读取执行时间"
+        if job is None:
+            return "签到任务未登记", ""
+        if job.next_run:
+            return "自动签到已开启", f"下次执行：{job.next_run}"
+        return "自动签到已开启", str(job.status or "")
 
     def get_page(self) -> list[dict]:
         """以卡片显示最近结果和当前计划，不显示 Cookie。"""
         result = self.get_data("last_result") or {}
-        state = "自动签到已开启" if self.get_state() else "自动签到已关闭"
+        state, schedule_detail = self._schedule_overview()
         status = result.get("message") or "暂无签到记录"
         gain = self._gain(result.get("gain"))
         if gain is None:
@@ -756,16 +975,22 @@ class NodeSeekV3(_PluginBase):
             ("最近结果", status, "mdi-check-circle-outline", "success" if result.get("success") else "info"),
             ("签到奖励", gain_text, "mdi-food-drumstick-outline", "warning"),
             ("最近执行", time_text, "mdi-clock-outline", "primary"),
-            ("自动签到", state, "mdi-calendar-clock", "primary"),
+            ("自动签到", state, "mdi-calendar-clock", "warning" if state == "计划无效" else "primary"),
         ]
         cols = []
         for title, value, icon, color in cards:
+            card_content = [
+                {"component": "div", "props": {"class": "d-flex align-center text-caption"},
+                 "content": [{"component": "VIcon", "props": {"size": "small", "class": "mr-2"}, "text": icon},
+                             {"component": "span", "text": title}]},
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold mt-2"}, "text": str(value)},
+            ]
+            if title == "自动签到" and schedule_detail:
+                card_content.append({"component": "div", "props": {"class": "text-caption mt-1"}, "text": schedule_detail})
             cols.append({"component": "VCol", "props": {"cols": 12, "sm": 6}, "content": [
                 {"component": "VCard", "props": {"variant": "tonal", "color": color, "class": "pa-3 h-100"},
-                 "content": [{"component": "div", "props": {"class": "d-flex align-center text-caption"},
-                              "content": [{"component": "VIcon", "props": {"size": "small", "class": "mr-2"}, "text": icon},
-                                          {"component": "span", "text": title}]},
-                             {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold mt-2"}, "text": str(value)}]}]})
+                 "content": card_content},
+            ]})
         overview = self._card("签到概览", "mdi-chart-box-outline", [
             {"component": "VRow", "content": cols},
         ])
