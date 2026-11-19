@@ -1,0 +1,26 @@
+# Python and local development caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Local configuration and runtime data
+.env
+.env.*
+!.env.example
+/config/
+/data/
+/backups/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini

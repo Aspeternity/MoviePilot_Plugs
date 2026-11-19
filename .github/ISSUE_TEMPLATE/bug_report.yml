@@ -1,0 +1,24 @@
+name: 问题反馈
+description: 报告插件配置或运行问题
+title: '[Bug] '
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: MoviePilot 和插件版本
+      placeholder: MoviePilot 3.2.8 / NodeSeekV3 1.6.0
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 问题描述与复现步骤
+      description: 说明实际结果、预期结果及相关配置选项。
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 仅提供必要片段，删除真实 Cookie、Token、密码和个人邮箱。
+      render: text

@@ -1,0 +1,25 @@
+{
+  "NodeSeekV3": {
+    "name": "NodeSeek 论坛签到",
+    "description": "通过 MoviePilot 浏览器定时执行 NodeSeek 论坛签到。",
+    "labels": "站点签到",
+    "version": "1.6.0",
+    "icon": "",
+    "author": "Aspeternity",
+    "level": 2,
+    "system_version": ">=3.2.8",
+    "history": {
+      "v1.6.0": "优化 Cookie 来源配置，新增 CookieCloud 登录验证并整理数据页。",
+      "v1.5.0": "调整 CookieCloud 模式和配置页获取按钮，不再回退手动 Cookie。",
+      "v1.4.1": "新增不显示 Cookie 内容的 CookieCloud 检测按钮。",
+      "v1.4.0": "可选复用 MoviePilot CookieCloud，签到前读取 NodeSeek Cookie。",
+      "v1.3.1": "调整随机签到提示与时间选择框的间距。",
+      "v1.3.0": "分离小时和分钟选择，优化概览时间并记录签到历史。",
+      "v1.2.0": "优化计划条件显示与时间选择，完善鸡腿奖励通知及签到概览。",
+      "v1.1.0": "增加随机签到时段，优化界面及错误诊断。",
+      "v1.0.0": "首次发布：定时签到、随机奖励和结果通知。"
+    },
+    "author_url": "https://github.com/Aspeternity",
+    "plugin_readme": "https://github.com/Aspeternity/MoviePilot_Plugs/blob/main/README.md"
+  }
+}

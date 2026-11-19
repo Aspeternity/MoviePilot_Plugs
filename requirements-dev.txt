@@ -1,0 +1,4 @@
+# Offline test dependencies; MoviePilot supplies the plugin's runtime environment.
+APScheduler~=3.11.2
+fastapi~=0.141.1
+pytest~=9.0.3
