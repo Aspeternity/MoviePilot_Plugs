@@ -50,7 +50,7 @@ onUnmounted(() => controller.abort())
     <VCardText v-else><Layout /></VCardText>
     <VCardActions
       v-if="show_switch"
-      class="app-dialog-actions position-sticky bottom-0 justify-end bg-surface"
+      class="app-dialog-actions position-sticky bottom-0 justify-end"
       style="z-index: 1"
     >
       <VBtn icon="mdi-cog-outline" color="primary" variant="text"
