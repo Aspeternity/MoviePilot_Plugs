@@ -683,7 +683,7 @@ class NodeSeekV3(_PluginBase):
                     {"component": "VExpansionPanelTitle", "props": {"class": "px-4"}, "content": [
                         {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
                          "text": "mdi-lan-connect"},
-                        {"component": "span", "props": {"class": "font-weight-medium"}, "text": "网络与浏览器"},
+                        {"component": "span", "props": {"class": "font-weight-medium"}, "text": "代理与 User-Agent"},
                         {"component": "VChip", "props": {"size": "small", "variant": "tonal", "class": "ml-3"},
                          "content": [{"component": "span", "props": {
                              "textContent": "{{use_proxy ? '使用系统代理' : '直连'}}",
