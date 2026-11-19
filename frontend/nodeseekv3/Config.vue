@@ -2,7 +2,6 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef } from 'vue'
 import { readMoviePilotResponse } from './MoviePilotResponse'
 import PluginDialog from './PluginDialog.vue'
-import { renderNodes } from './RenderNodes'
 
 const props = defineProps({
   api: { type: [Object, Function], required: true },
@@ -13,6 +12,16 @@ const emit = defineEmits(['save', 'switch', 'close'])
 const model = reactive({ ...props.initialConfig })
 const layout = shallowRef(null)
 const root = ref(null)
+const section = ref('basic')
+const sections = [
+  { key: 'basic', label: '签到设置', icon: 'mdi-tune-variant' },
+  { key: 'plan', label: '签到计划', icon: 'mdi-clock-outline' },
+  { key: 'login', label: '登录与网络', icon: 'mdi-fingerprint' },
+]
+const switches = [
+  { key: 'enabled', label: '启用定时签到' }, { key: 'onlyonce', label: '保存后立即签到一次' },
+  { key: 'random', label: '随机奖励', hint: '关闭时使用固定奖励' }, { key: 'notify', label: '发送签到通知' },
+]
 const loading = ref(true)
 const loadFailed = ref(false)
 const checking = ref('')
@@ -56,7 +65,9 @@ function update(field, value) {
 }
 
 function timeText(key) {
-  return [model[`${key}_hour`] ?? '', model[`${key}_minute`] ?? ''].join(':')
+  const hour = model[key + '_hour']
+  const minute = model[key + '_minute']
+  return hour && minute ? hour + ':' + minute : ''
 }
 
 const bindings = computed(() => {
@@ -76,10 +87,6 @@ const bindings = computed(() => {
     windowSummary: valid ? `每天 ${start}–${end} 随机签到一次 · 北京时间` : '',
     useCloud: cloud,
     useManual: !cloud,
-    proxyLabel: model.use_proxy ? '使用系统代理' : '直连',
-    verifying: checking.value === 'verify',
-    checkingLogin: Boolean(checking.value),
-    busy: Boolean(checking.value),
     needsLogin: !verified,
     loginMessage: checking.value ? '' : result?.message || (!touchedLogin.value && initialNotice.value) || '',
     loginAlertType: result?.success ? 'success' : result?.type || 'warning',
@@ -159,24 +166,23 @@ async function save() {
     emit('save', snapshot)
     return
   }
+  section.value = 'login'
   await nextTick()
   root.value?.querySelector('[data-login-feedback]')?.focus()
 }
 
-const Layout = () => renderNodes(layout.value ? [layout.value] : [], {
-  model,
-  bindings: bindings.value,
-  actions: { verifyLogin: verify },
-  update,
-  submit: save,
-})
+function updateTime(key, value) {
+  const [hour, minute] = value.split(':')
+  model[key + '_hour'] = hour || null
+  model[key + '_minute'] = minute || null
+}
 
 onMounted(load)
 onUnmounted(() => controller.abort())
 </script>
 
 <template>
-  <PluginDialog title="NodeSeek 论坛签到 - 插件配置" divider @close="emit('close')">
+  <PluginDialog section="插件配置" @close="emit('close')">
     <div v-if="loading">
       <VProgressLinear indeterminate aria-label="正在加载配置" />
     </div>
@@ -186,16 +192,83 @@ onUnmounted(() => controller.abort())
         <VBtn class="mt-3" color="error" variant="tonal" @click="load">重试</VBtn>
       </VAlert>
     </div>
-    <fieldset v-else ref="root" :disabled="Boolean(checking)" class="pa-0 ma-0" style="border: 0; min-inline-size: 0">
-      <Layout />
-    </fieldset>
+    <form v-else ref="root" novalidate @submit.prevent="save">
+      <div class="ns-settings">
+        <nav class="ns-nav" aria-label="配置分组">
+          <button v-for="item in sections" :key="item.key" type="button" :disabled="Boolean(checking)"
+                  :aria-current="section === item.key ? 'page' : undefined" @click="section = item.key">
+            <VIcon :icon="item.icon" />{{ item.label }}
+          </button>
+        </nav>
+        <fieldset class="ns-edit" :disabled="Boolean(checking)">
+          <h3>{{ sections.find(item => item.key === section).label }}</h3>
+          <template v-if="section === 'basic'">
+            <label v-for="item in switches" :key="item.key" class="ns-setting">
+              <span>{{ item.label }}<small v-if="item.hint">{{ item.hint }}</small></span>
+              <input v-model="model[item.key]" type="checkbox" class="ns-switch" />
+            </label>
+            <p v-if="bindings.needsLogin && (model.enabled || model.onlyonce)" class="ns-hint">保存时会验证当前登录方式。</p>
+          </template>
+          <template v-else-if="section === 'plan'">
+            <div class="ns-choice" role="group" aria-label="计划模式">
+              <button type="button" :aria-pressed="bindings.windowMode" @click="update('schedule_mode', 'window')">随机时段</button>
+              <button type="button" :aria-pressed="bindings.cronMode" @click="update('schedule_mode', 'cron')">Cron 定时</button>
+            </div>
+            <template v-if="bindings.windowMode">
+              <div class="ns-period">
+                <label v-for="(label, key) in { window_start: '开始时间', window_end: '结束时间' }" :key="key" class="ns-field">
+                  {{ label }}<input type="time" :value="timeText(key)"
+                                   @input="updateTime(key, $event.target.value)" />
+                </label>
+              </div>
+              <p class="ns-hint" :class="{ 'ns-error': bindings.windowError }">{{ bindings.windowError || bindings.windowSummary }}</p>
+            </template>
+            <template v-else>
+              <VCronField :model-value="model.cron" label="Cron 表达式" class="ns-cron"
+                          hint="北京时间 · 星期可填写 mon（周一）或 sun（周日）。" persistent-hint
+                          @update:model-value="update('cron', $event)" />
+              <p v-if="bindings.legacyCronDays && layout.legacy_weekdays" class="ns-hint">
+                旧规则当前按{{ layout.legacy_weekdays }}执行。修改星期时，0 表示周日。
+              </p>
+            </template>
+          </template>
+          <template v-else>
+            <div class="ns-choice" role="group" aria-label="登录方式">
+              <button type="button" :aria-pressed="bindings.useCloud" @click="update('cookiecloud', true)"><VIcon icon="mdi-cloud-outline" />CookieCloud</button>
+              <button type="button" :aria-pressed="bindings.useManual" @click="update('cookiecloud', false)"><VIcon icon="mdi-key-outline" />手动 Cookie</button>
+            </div>
+            <p v-if="bindings.useCloud" class="ns-hint">使用 MoviePilot 中配置的 CookieCloud。</p>
+            <label v-else class="ns-field">NodeSeek Cookie
+              <input type="password" autocomplete="off" :value="model.cookie" @input="update('cookie', $event.target.value)" />
+            </label>
+            <button type="button" class="ns-secondary" :disabled="Boolean(checking)" @click="verify">
+              {{ checking === 'verify' ? '正在验证…' : '验证登录' }}
+            </button>
+            <div data-login-feedback tabindex="-1" role="status" aria-live="polite" class="ns-feedback">
+              <p v-if="checking" class="ns-hint">正在验证登录…</p>
+              <p v-else-if="bindings.loginMessage" class="ns-hint" :class="'ns-' + bindings.loginAlertType">{{ bindings.loginMessage }}</p>
+            </div>
+            <details class="ns-network">
+              <summary>代理与 User-Agent</summary>
+              <label class="ns-setting"><span>使用 MoviePilot 系统代理</span>
+                <input type="checkbox" class="ns-switch" :checked="model.use_proxy" @change="update('use_proxy', $event.target.checked)" />
+              </label>
+              <label class="ns-field">浏览器 User-Agent
+                <input type="text" maxlength="1024" placeholder="使用宿主默认值" :value="model.user_agent"
+                       @input="update('user_agent', $event.target.value)" />
+              </label>
+            </details>
+          </template>
+        </fieldset>
+      </div>
+    </form>
     <template #actions>
-      <VCardActions class="app-dialog-actions">
-        <VBtn color="info" variant="tonal" prepend-icon="mdi-database-eye-outline" @click="emit('switch')">查看数据</VBtn>
-        <VSpacer />
-        <VBtn v-if="layout" color="primary" variant="flat" prepend-icon="mdi-content-save" class="px-5"
-              :disabled="Boolean(checking)" :loading="checking === 'save'" @click="save">保存</VBtn>
-      </VCardActions>
+      <footer class="ns-edit-foot">
+        <button type="button" class="ns-secondary" :disabled="Boolean(checking)" @click="emit('switch')">查看数据</button>
+        <button v-if="layout" type="button" class="ns-save" :disabled="Boolean(checking)" @click="save">
+          {{ checking === 'save' ? '正在验证…' : '保存' }}
+        </button>
+      </footer>
     </template>
   </PluginDialog>
 </template>

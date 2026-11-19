@@ -423,7 +423,7 @@ class NodeSeekV3(_PluginBase):
 
     @staticmethod
     def get_render_mode() -> tuple[str, str]:
-        return "vue", "dist/assets/v5"
+        return "vue", "dist/assets/v6"
 
     def get_api(self) -> list[dict[str, Any]]:
         """注册需要管理员身份的只读登录验证接口。"""
@@ -1271,6 +1271,7 @@ class NodeSeekV3(_PluginBase):
             "component": "VForm",
             "enabled": self.get_state(),
             "login_notice": notice,
+            "legacy_weekdays": self._legacy_cron_weekdays(),
             "content": [basic, self._schedule_form(), self._account_form()],
         }], defaults
 
@@ -1330,14 +1331,32 @@ class NodeSeekV3(_PluginBase):
     def _history_table(self, records: list[SignRecord]) -> dict:
         rows = []
         for record in records:
-            rows.append({"component": "tr", "content": [
-                {"component": "td", "props": {"style": "white-space: nowrap;"}, "text": self._format_time(record["time"])},
-                {"component": "td", "props": {"style": {"overflow-wrap": "anywhere"}}, "text": record["message"]},
+            timestamp = self._format_time(record["time"])
+            finished = datetime.fromisoformat(record["time"]).astimezone(_BEIJING)
+            status = self._record_status(record)
+            label = {"签到成功": "已签到", "失败": "签到失败", "未确认": "结果未确认"}.get(status, status)
+            message = record["message"]
+            mark = {"component": "span", "props": {"class": "ns-mark"}, "text": label}
+            if message and message not in (label, status, "今日已签到"):
+                result = {"component": "details", "content": [
+                    {"component": "summary", "content": [mark]},
+                    {"component": "div", "props": {"class": "ns-reason"}, "text": message},
+                ]}
+            else:
+                result = mark
+            rows.append({"component": "tr", "props": {
+                "class": {"失败": "ns-error", "未确认": "ns-warning"}.get(status, "ns-success"),
+            }, "content": [
+                {"component": "td", "props": {"title": timestamp}, "content": [
+                    {"component": "span", "text": f"{finished.month} 月 {finished.day} 日"},
+                    {"component": "span", "props": {"class": "ns-clock"}, "text": finished.strftime("%H:%M")},
+                ]},
+                {"component": "td", "content": [result]},
                 {"component": "td", "text": self._reward_text(record)},
             ]})
         return {"component": "VTable", "props": {"density": "comfortable", "fixed-header": True}, "content": [
             {"component": "thead", "content": [{"component": "tr", "content": [
-                {"component": "th", "text": "时间（北京时间）"},
+                {"component": "th", "text": "时间"},
                 {"component": "th", "text": "结果"},
                 {"component": "th", "text": "奖励"},
             ]}]},
@@ -1368,7 +1387,9 @@ class NodeSeekV3(_PluginBase):
                 {"component": "nav", "props": {"class": "d-flex flex-wrap justify-center mt-2", "aria-label": "签到历史分页"},
                  "content": buttons},
             ]}]
-        return self._card("签到历史", "mdi-history", content)
+        history = self._card("签到历史", "mdi-history", content)
+        history["props"]["class"] = "ns-history"
+        return history
 
     def _today_overview(
         self, now: datetime, confirmed: bool, latest: SignRecord | None, schedule: ScheduleOverview
@@ -1420,6 +1441,19 @@ class NodeSeekV3(_PluginBase):
                 ),
             ]},
         ])
+        # 旧前端仍可直接渲染概览节点。票券从同一次快照读取状态、日期与奖励。
+        latest_display = latest_time
+        if latest:
+            finished = datetime.fromisoformat(latest["time"]).astimezone(_BEIJING)
+            days_ago = (now.date() - finished.date()).days
+            if days_ago in (0, 1):
+                latest_display = f"{('今天', '昨天')[days_ago]} {finished:%H:%M}"
+        overview["ticket"] = {
+            "date": f"{now.month} 月 {now.day} 日 · 星期{'一二三四五六日'[now.weekday()]}",
+            "status": today_status, "status_color": today_color, "gain": today_reward,
+            "reward": reward, "latest": latest_display, "latest_status": latest_status.get(result, result),
+            "next": schedule.label, "next_detail": schedule.detail, "retention_days": _HISTORY_DAYS,
+        }
         return [overview, self._history_page(records)]
 
     def stop_service(self) -> None:

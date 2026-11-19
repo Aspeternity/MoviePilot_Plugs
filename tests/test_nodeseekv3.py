@@ -1147,6 +1147,19 @@ def test_today_uses_registered_cron_and_keeps_confirmed_reward(plugin_module, hi
     assert _card_text(plugin, "最近签到") == ["11-19 07:02", "结果未确认"]
 
 
+def test_ticket_reward_and_date_follow_beijing_day(plugin_module, history_clock):
+    plugin = plugin_module.NodeSeekV3()
+    now = history_clock[0]
+    plugin.data["sign_history"] = [{"time": now.isoformat(), "success": True, "message": "签到成功", "gain": 0}]
+    ticket = plugin.get_page()[0]["ticket"]
+    assert (ticket["status"], ticket["gain"], ticket["latest"]) == ("已签到", 0, "今天 12:00")
+    assert ticket["date"] == "11 月 19 日 · 星期四"
+    history_clock[0] += timedelta(days=1)
+    ticket = plugin.get_page()[0]["ticket"]
+    assert ticket["gain"] is None and ticket["reward"] == "—"
+    assert ticket["latest"] == "昨天 12:00" and ticket["date"] == "11 月 20 日 · 星期五"
+
+
 def test_history_has_ten_rows_per_page_in_chronological_order(plugin_module, history_clock):
     plugin = plugin_module.NodeSeekV3()
     today = history_clock[0]
@@ -1160,6 +1173,6 @@ def test_history_has_ten_rows_per_page_in_chronological_order(plugin_module, his
     assert [node["props"]["aria-label"] for node in pagination["content"]] == ["第 1 页", "第 2 页", "第 3 页"]
     rows = [page["content"][0]["content"][1]["content"] for page in pages["content"]]
     assert [len(page) for page in rows] == [10, 10, 1]
-    assert rows[1][0]["content"][1]["text"] == "记录 10"
+    assert rows[1][0]["content"][1]["content"][0]["content"][1]["text"] == "记录 10"
     plugin.data["sign_history"] = plugin.data["sign_history"][:10]
     assert plugin.get_page()[1]["content"][2]["content"][0]["component"] == "VTable"
