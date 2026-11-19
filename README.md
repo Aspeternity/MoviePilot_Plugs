@@ -17,7 +17,7 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
    ```
 
 2. 刷新插件市场，搜索「NodeSeek 论坛签到」，确认来源为本仓库后安装。
-3. 打开插件配置，选择 Cookie 来源，设置签到计划并保存。
+3. 打开插件配置，选择 Cookie 来源并验证登录，设置签到计划后启用定时签到并保存。
 
 仓库代码通过 `main` 分支和 `package.v3.json` 提供，无需下载 ZIP 后手动安装，
 也不要求先创建 GitHub Release。MoviePilot 需要能够访问 GitHub。
@@ -35,7 +35,7 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
 - 重启或重载时沿用仍未到期的随机时间。仅当原时间已过、仍在时段内且当天尚未执行时，从剩余时段重新抽取。
 - Cron 新编辑的星期按编辑器的编号执行，0 和 7 表示周日。旧数字规则沿用原来实际执行的星期，配置表单显示对应日期。
 - 支持随机或固定奖励、结果通知、系统代理，以及保存配置后执行一次。
-- 「查看数据」展示今日签到、最近一次和下次计划，签到历史每页 10 条，保留最近 30 个北京时间自然日。
+- 「查看数据」展示今日签到、今日奖励、最近签到和下次执行，签到历史每页 10 条，保留最近 30 个北京时间自然日。
 - 仅在确认签到成功或已签到后记录当日完成状态；旧版本未保存的历史无法补回。
 
 ### Cookie 来源
@@ -46,9 +46,12 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
 按宿主同步间隔刷新独立快照，并在每次签到前读取 `nodeseek.com` 分组。
 云端读取失败时，本次签到失败，不回退到手动 Cookie。
 
-「验证 CookieCloud 登录」使用表单当前的 User-Agent 和代理设置检查登录，结果显示在按钮下方。
-验证只读，不触发签到、不显示 Cookie。定时签到在保存后才使用新的网络设置。
-请先在浏览器登录 NodeSeek，再同步 CookieCloud。同步操作本身不会续期登录状态。
+「验证手动 Cookie」和「验证 CookieCloud 登录」使用表单当前的 User-Agent 和代理设置确认登录。
+验证通过后可以开启定时签到或「保存后立即签到一次」，保存时插件会检查实际配置。
+更换登录方式、手动 Cookie、代理或 User-Agent 后，需重新验证再启用。
+运行时若 NodeSeek 明确返回未登录，定时签到会暂停，更新 Cookie 并验证后可重新启用。
+临时网络故障会记录本次结果，保留下次排期。使用 CookieCloud 时，请先在浏览器登录 NodeSeek，
+再同步 CookieCloud。
 
 宿主 CookieCloud 按站点聚合子域，并丢弃原始 Cookie 的域、路径、有效期等属性；
 插件仅将目标分组注入 NodeSeek 地址。真实 Cookie 是登录凭证，

@@ -73,12 +73,13 @@ def plugin_module(monkeypatch):
     fake_logger = FakeLogger()
     module("app", __path__=[])
     module("app.sdk", __path__=[])
-    module("app.sdk.browser", launch_browser_context=lambda **kwargs: None)
+    module("app.sdk.browser", launch_browser_context=lambda **kwargs: FakeContext(FakePage("authenticated")))
     module("app.sdk.config", settings=types.SimpleNamespace(PROXY_SERVER=None))
     module("app.sdk.logging", logger=fake_logger)
     module("app.sdk.plugin", _PluginBase=FakeBase)
     module("app.sdk.scheduler", add_plugin_once_job=lambda *args, **kwargs: True,
-           list_scheduler_jobs=lambda: [], remove_plugin_once_job=lambda *args: None)
+           list_scheduler_jobs=lambda: [], remove_plugin_once_job=lambda *args: None,
+           update_plugin_job=lambda *args: None)
     module("app.sdk.security", verify_token=lambda: None)
     module("app.schemas", TokenPayload=types.SimpleNamespace)
     module("app.schemas.types", MessageType=types.SimpleNamespace(SiteMessage="site"))
@@ -265,7 +266,7 @@ def test_cookiecloud_failure_does_not_fall_back_or_leak(plugin_module, monkeypat
     plugin = plugin_module.NodeSeekV3()
     plugin._config.update(cookiecloud=True, cookie="session=manual-secret")
     monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: response)
-    assert plugin._sign_cookies() == []
+    assert plugin._login_source(plugin._config)[1] == []
     assert plugin._config["cookie"] == "session=manual-secret"
     assert "secret" not in repr(plugin_module.logger.messages)
 
@@ -279,7 +280,7 @@ def test_cookiecloud_exception_no_manual_and_disabled_legacy(plugin_module, monk
     monkeypatch.setattr(plugin_module, "_download_cookiecloud", fail)
     plugin.init_plugin({"cookie": "session=manual-secret"})
     assert not plugin._config["cookiecloud"]
-    assert plugin._sign_cookies()[0]["value"] == "manual-secret"
+    assert plugin._login_source(plugin._config)[1][0]["value"] == "manual-secret"
     assert not plugin_module.logger.messages
     plugin._config.update(cookiecloud=True, cookie="")
     result = plugin._request_sign()
@@ -307,7 +308,7 @@ def test_cookiecloud_host_facade_contract(plugin_module, monkeypatch):
 def test_verify_login_requires_explicit_evidence_and_is_read_only(plugin_module, monkeypatch, observed, expected):
     """只有明确登录证据才成功，验证不执行签到或更改配置。"""
     plugin = plugin_module.NodeSeekV3()
-    plugin.init_plugin({"cookie": "session=manual-secret", "cookiecloud": False, "enabled": True})
+    plugin.init_plugin({"cookie": "session=manual-secret", "cookiecloud": False})
     before = plugin._config.copy()
     monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: ({"nodeseek.com": "session=cloud-secret"}, ""))
     page = FakePage(observed)
@@ -442,13 +443,94 @@ def test_cookiecloud_fallback_does_not_mask_signin_result(plugin_module, monkeyp
 def test_cookiecloud_verification_requires_admin(plugin_module):
     """验证接口要求管理员，且不再暴露获取 Cookie 接口。"""
     plugin = plugin_module.NodeSeekV3()
-    route = next(r for r in plugin.get_api() if r["path"] == "/cookiecloud_verify")
-    assert route["auth"] == "bear" and route["methods"] == ["POST"]
-    assert route["dependencies"][0].dependency == plugin_module._require_administrator
+    routes = plugin.get_api()
+    assert {route["path"] for route in routes} == {"/cookiecloud_verify", "/manual_verify"}
+    for route in routes:
+        assert route["auth"] == "bear" and route["methods"] == ["POST"]
+        assert route["dependencies"][0].dependency == plugin_module._require_administrator
     plugin_module._require_administrator(types.SimpleNamespace(super_user=True))
     with pytest.raises(plugin_module.HTTPException) as exc:
         plugin_module._require_administrator(types.SimpleNamespace(super_user=False))
     assert exc.value.status_code == 403
+
+
+def test_manual_verification_reads_draft_without_writing_settings(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    plugin.init_plugin({"cookiecloud": True, "cookie": "session=saved"})
+    context = FakeContext(FakePage("authenticated"))
+    monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: pytest.fail("手动验证不读取云端"))
+    monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: context)
+    options = plugin_module.ManualVerificationOptions(cookie="session=draft-private", user_agent="Draft")
+    result = plugin.verify_manual_login(options)
+    assert result["success"] and context.closed and context.cookies[0]["value"] == "draft-private"
+    assert plugin._config["cookie"] == "session=saved" and not plugin.data
+    assert "draft-private" not in repr(result) + repr(plugin_module.logger.messages)
+
+
+@pytest.mark.parametrize("settings, cloud, browser_state, reason", [
+    ({"cookie": ""}, None, None, "manual_missing"),
+    ({"cookie": "invalid cookie"}, None, None, "manual_invalid"),
+    ({"cookiecloud": True}, (None, "transient"), None, "cloud_unavailable"),
+    ({"cookiecloud": True}, ({}, ""), None, "cookie_missing"),
+    ({"cookiecloud": True}, ({"nodeseek.com": "session=cloud-secret"}, ""), "signed_out", "signed_out"),
+    ({"cookie": "session=manual-secret"}, None, "unknown", "unknown"),
+])
+def test_save_rejects_unverified_periodic_and_once(plugin_module, monkeypatch, settings, cloud, browser_state, reason):
+    plugin = plugin_module.NodeSeekV3()
+    monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: cloud)
+    monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: FakeContext(FakePage(browser_state)))
+    monkeypatch.setattr(plugin_module, "add_plugin_once_job", lambda *a, **k: pytest.fail("登录不通过不能提交签到"))
+    plugin.init_plugin({**settings, "enabled": True, "onlyonce": True, "custom": "keep"})
+    assert not plugin.get_state()
+    assert plugin.saved_config["enabled"] is False and plugin.saved_config["onlyonce"] is False
+    assert plugin.saved_config["custom"] == "keep"
+    assert all(service["id"] != plugin_module._SIGN_SERVICE_ID for service in plugin.get_service())
+    assert plugin.data[plugin_module._LOGIN_STATE_KEY]["status"] == reason
+    assert _card_text(plugin, "今日签到") == ["今日无计划"]
+    assert _card_text(plugin, "下次执行")[0] in ("待验证登录", "登录已失效")
+    assert all(value not in json.dumps(plugin.data) for value in ("manual-secret", "cloud-secret"))
+
+
+def test_proven_saved_login_is_reused_until_network_or_credentials_change(plugin_module, monkeypatch):
+    config = {"enabled": True, "cookie": "session=saved-private", "user_agent": "Agent"}
+    plugin = plugin_module.NodeSeekV3()
+    check_calls = []
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: check_calls.append(cfg["user_agent"]) or "authenticated")
+    plugin.init_plugin(config)
+    assert plugin.get_state() and check_calls == ["Agent"]
+    plugin.init_plugin({**config, "notify": False})
+    assert plugin.get_state() and check_calls == ["Agent"]
+    monkeypatch.setattr(plugin, "_check_login", lambda cfg: check_calls.append(cfg["user_agent"]) or "signed_out")
+    plugin.init_plugin({**config, "user_agent": "New agent"})
+    assert not plugin.get_state() and check_calls == ["Agent", "New agent"]
+
+
+def test_logout_pauses_schedule_but_timeout_keeps_next_run(plugin_module, monkeypatch, history_clock):
+    plugin = plugin_module.NodeSeekV3()
+    config = {"enabled": True, "cookie": "session=saved-private"}
+    plugin.init_plugin(config)
+    refreshes = []
+    monkeypatch.setattr(plugin_module, "update_plugin_job", refreshes.append)
+    service = plugin.get_service()[0]["func"]
+    outcomes = iter([
+        {"success": False, "message": "网络超时", "gain": None},
+        {"success": False, "message": "未登录", "gain": None, "login_expired": True},
+    ])
+    monkeypatch.setattr(plugin, "_request_sign", lambda cfg: next(outcomes))
+    service()
+    assert plugin.get_state() and not refreshes
+    history_clock[0] += timedelta(seconds=1)
+    service()
+    assert not plugin.get_state() and refreshes == ["NodeSeekV3"]
+    assert _card_text(plugin, "今日签到") == ["签到失败"]
+    assert _card_text(plugin, "下次执行")[0] == "登录已失效"
+    assert plugin.get_service() == []
+    service()  # 调度器里已被取出的回调仍不能重复跑
+
+    plugin.init_plugin(config)
+    assert not plugin.get_state() and plugin.saved_config["enabled"] is False
+    plugin.init_plugin({**config, plugin_module._RECHECK_FIELD: True})
+    assert plugin.get_state() and plugin_module._RECHECK_FIELD not in plugin.saved_config
 
 
 def test_cookiecloud_source_config_ui(plugin_module):
@@ -502,7 +584,7 @@ def test_manual_mode_requires_cookie_and_ignores_cloud(plugin_module, monkeypatc
     monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: pytest.fail("手动模式不得访问云端"))
     monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: pytest.fail("缺少 Cookie 不得启动浏览器"))
     plugin._config.update(cookiecloud=False, cookie="")
-    assert plugin._request_sign()["message"] == "未配置有效的 Cookie"
+    assert plugin._request_sign()["message"] == "请先填写 NodeSeek Cookie。"
 
 
 def test_sign_idempotence_and_failed_retry(plugin_module, monkeypatch):
@@ -511,7 +593,7 @@ def test_sign_idempotence_and_failed_retry(plugin_module, monkeypatch):
     plugin._config["notify"] = True
     calls = []
 
-    def request():
+    def request(config):
         """依次模拟失败和成功。"""
         calls.append(1)
         return {"success": False, "message": "失败", "gain": None} if len(calls) == 1 else \
@@ -640,7 +722,7 @@ def test_scheduled_window_checks_delivery_time(plugin_module, monkeypatch, day_o
     settings = {"enabled": True, "cookie": "session=example", "schedule_mode": "window"}
     plugin.init_plugin(settings)
     calls = []
-    monkeypatch.setattr(plugin, "sign", lambda: calls.append("sign"))
+    monkeypatch.setattr(plugin, "sign", lambda config: calls.append("sign"))
     service = plugin.get_service()[0]
     trigger = service["trigger"]
     first = trigger.get_next_fire_time(None, day.replace(hour=7))
@@ -691,7 +773,7 @@ def test_legacy_config_and_form_fields(plugin_module):
                         "random": False, "custom": "keep"})
     assert plugin._config["schedule_mode"] == "cron"
     assert plugin._config["custom"] == "keep"
-    assert plugin.get_service()[0]["trigger"].__class__.__name__ == "CronTrigger"
+    assert isinstance(plugin.get_service()[0]["trigger"], plugin_module.CronTrigger)
     form, defaults = plugin.get_form()
     encoded = json.dumps(form, ensure_ascii=False)
     for field in ("enabled", "cookie", "cookiecloud", "cron", "random", "notify", "use_proxy",
@@ -740,7 +822,9 @@ def test_form_conditional_time_selection(plugin_module):
 
 def test_schedule_overview_reads_registered_job_without_drawing(plugin_module, monkeypatch):
     plugin = plugin_module.NodeSeekV3()
-    plugin.init_plugin({"enabled": True, "schedule_mode": "window"})
+    config = {"enabled": True, "schedule_mode": "window", "cookie": "session=example"}
+    plugin.init_plugin(config)
+    saved = plugin.data.copy()
     monkeypatch.setattr(plugin_module.random, "randrange", lambda *_: pytest.fail("概览不能抽取随机时间"))
     monkeypatch.setattr(plugin_module, "list_scheduler_jobs", lambda: [
         types.SimpleNamespace(id="NodeSeekV3_NodeSeekV3CookieCloud", next_run="5 分钟", status="等待"),
@@ -748,9 +832,9 @@ def test_schedule_overview_reads_registered_job_without_drawing(plugin_module, m
     ])
     overview = json.dumps(plugin.get_page(), ensure_ascii=False)
     assert "下次执行" in overview and "1 小时" in overview and "5 分钟" not in overview
-    assert plugin.data == {}
+    assert plugin.data == saved
 
-    plugin.init_plugin({"enabled": True, "schedule_mode": "window", "window_start": "10:00", "window_end": "08:00"})
+    plugin.init_plugin({**config, "window_start": "10:00", "window_end": "08:00"})
     overview = json.dumps(plugin.get_page(), ensure_ascii=False)
     assert "计划无效" in overview and "1 小时" not in overview
 
@@ -764,17 +848,19 @@ def test_gain_parse(plugin_module, value, message, expected):
     assert plugin_module.NodeSeekV3._gain(value, message) == expected
 
 
-def test_overview_legacy_and_known_gain(plugin_module):
-    """概览兼容旧记录，并展示新记录的奖励数。"""
+def test_overview_legacy_and_known_gain(plugin_module, history_clock):
+    """旧记录可用于最近一次签到，当日奖励只取当天。"""
     plugin = plugin_module.NodeSeekV3()
-    yesterday = datetime.now(plugin_module._BEIJING).date() - timedelta(days=1)
+    today = history_clock[0]
+    yesterday = today - timedelta(days=1)
     plugin.data["sign_history"] = []
-    plugin.data["last_result"] = {"success": True, "message": "今日已签到", "time": yesterday.isoformat()}
-    page = json.dumps(plugin.get_page(), ensure_ascii=False)
-    assert "奖励：未知" in page and "今日暂无确认记录" in page and "站点已签到" in page
-    assert "暂无签到记录" not in page
+    plugin.data["last_result"] = {"success": True, "message": "今日已签到", "time": yesterday.isoformat(), "gain": 6}
+    assert _card_text(plugin, "签到奖励") == ["—"]
+    assert _card_text(plugin, "最近签到") == [yesterday.strftime("%m-%d %H:%M"), "站点已签到"]
+    plugin.data["last_result"].update(time=today.isoformat(), gain=None)
+    assert _card_text(plugin, "签到奖励") == ["未知"]
     plugin.data["last_result"]["gain"] = 0
-    assert "0 个鸡腿" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert _card_text(plugin, "签到奖励") == ["0 个鸡腿"]
 
 
 def test_legacy_today_confirmation_skips_repeated_sign_and_keeps_reward(plugin_module, monkeypatch):
@@ -855,7 +941,7 @@ def test_history_keeps_legacy_and_records_success_failure(plugin_module, monkeyp
     plugin.data["last_result"] = old.copy()
     sequence = iter([{"success": False, "message": "网络错误", "gain": None},
                      {"success": True, "message": "签到成功", "gain": 8}])
-    monkeypatch.setattr(plugin, "_request_sign", lambda: next(sequence))
+    monkeypatch.setattr(plugin, "_request_sign", lambda config: next(sequence))
     plugin.sign()
     plugin.sign()
     history = plugin.data[plugin_module._SIGN_STATE_KEY]["records"]
@@ -884,8 +970,17 @@ def test_malformed_legacy_and_failed_reward_are_safe(plugin_module):
         "time": datetime.now(plugin_module._BEIJING).isoformat(),
         "success": False, "message": "当前余额 5 个鸡腿", "gain": 5,
     }
-    overview = json.dumps(plugin.get_page()[0], ensure_ascii=False)
-    assert "今日最近一次失败" in overview and "奖励：—" in overview
+    assert _card_text(plugin, "今日签到") == ["签到失败"]
+    assert _card_text(plugin, "签到奖励") == ["—"]
+
+
+def _card_text(plugin, title):
+    cards = plugin.get_page()[0]["content"][2]["content"][0]["content"]
+    for column in cards:
+        content = column["content"][0]["content"]
+        if content[0]["content"][1]["text"] == title:
+            return [item["text"] for item in content[1:]]
+    raise AssertionError(f"缺少 {title} 卡片")
 
 
 @pytest.fixture
@@ -938,7 +1033,7 @@ def test_legacy_data_not_deleted_until_snapshot_is_readable(plugin_module, histo
     monkeypatch.setattr(plugin, "save_data", lambda *args: None)
     plugin.init_plugin()
     assert plugin.data == {"last_result": old}
-    assert "已确认签到" in json.dumps(plugin.get_page(), ensure_ascii=False)
+    assert _card_text(plugin, "今日签到") == ["已签到"]
     monkeypatch.setattr(plugin, "save_data", save)
     plugin._history_timer.fire()
     assert set(plugin.data) == {plugin_module._SIGN_STATE_KEY}
@@ -949,7 +1044,7 @@ def test_midnight_preserves_sign_day_and_completion_time(plugin_module, history_
     started = history_clock[0].replace(hour=23, minute=59)
     history_clock[0] = started
 
-    def sign():
+    def sign(config):
         history_clock[0] += timedelta(minutes=2)
         return {"success": True, "message": "签到成功", "gain": 0}
 
@@ -958,7 +1053,42 @@ def test_midnight_preserves_sign_day_and_completion_time(plugin_module, history_
     state = plugin.data[plugin_module._SIGN_STATE_KEY]
     assert state["confirmed_day"] == state["records"][0]["day"] == started.date().isoformat()
     assert state["records"][0]["time"].startswith(history_clock[0].date().isoformat() + "T00:01")
-    assert "今日暂无确认记录" in json.dumps(plugin.get_page()[0], ensure_ascii=False)
+    assert _card_text(plugin, "今日签到") == ["今日无计划"]
+
+
+def test_today_uses_registered_cron_and_keeps_confirmed_reward(plugin_module, history_clock, monkeypatch):
+    today = history_clock[0].replace(hour=7)
+    history_clock[0] = today
+    plugin = plugin_module.NodeSeekV3()
+    settings = {"enabled": True, "cookie": "session=mock"}
+    plugin.init_plugin(settings)
+    service = plugin.get_service()[0]
+    trigger = service["trigger"]
+    trigger.get_next_fire_time(None, today)
+    job = types.SimpleNamespace(id="NodeSeekV3_NodeSeekV3", next_run="1 小时", status="等待")
+    monkeypatch.setattr(plugin_module, "list_scheduler_jobs", lambda: [job])
+    assert _card_text(plugin, "今日签到") == ["等待签到"]
+    assert _card_text(plugin, "下次执行") == ["今天 08:00"]
+    plugin._running_day = today.date()
+    assert _card_text(plugin, "今日签到") == ["签到中"]
+    plugin._running_day = None
+    history_clock[0] = today.replace(hour=9)
+    trigger.get_next_fire_time(today.replace(hour=8), history_clock[0])
+    assert _card_text(plugin, "今日签到") == ["今日未执行"]
+    assert _card_text(plugin, "下次执行") == ["明天 08:00"]
+    plugin.init_plugin({**settings, "cron": "0 8 * * mon"})
+    plugin.get_service()[0]["trigger"].get_next_fire_time(None, history_clock[0])
+    assert _card_text(plugin, "今日签到") == ["今日无计划"]
+    assert _card_text(plugin, "下次执行") == ["11-23 08:00"]
+
+    plugin.data["sign_history"] = [
+        {"time": today.isoformat(), "success": True, "message": "签到成功", "gain": 5},
+        {"time": (today + timedelta(minutes=1)).isoformat(), "success": True, "message": "今日已签到"},
+        {"time": (today + timedelta(minutes=2)).isoformat(), "success": False, "message": "签到未确认"},
+    ]
+    assert _card_text(plugin, "今日签到") == ["已签到"]
+    assert _card_text(plugin, "签到奖励") == ["5 个鸡腿"]
+    assert _card_text(plugin, "最近签到") == ["11-19 07:02", "结果未确认"]
 
 
 def test_history_has_ten_rows_per_page_in_chronological_order(plugin_module, history_clock):
@@ -968,8 +1098,12 @@ def test_history_has_ten_rows_per_page_in_chronological_order(plugin_module, his
         {"time": (today - timedelta(days=offset)).isoformat(), "success": False, "message": f"记录 {offset}"}
         for offset in reversed(range(21))
     ]
-    panels = plugin.get_page()[1]["content"][2]["content"][1]
-    assert panels["props"]["modelValue"] == 1
-    rows = [panel["content"][1]["content"][0]["content"][1]["content"] for panel in panels["content"]]
+    stepper = plugin.get_page()[1]["content"][2]["content"][0]
+    assert stepper["props"]["modelValue"] == 1
+    pages, pagination = stepper["content"]
+    assert [node["props"]["aria-label"] for node in pagination["content"]] == ["第 1 页", "第 2 页", "第 3 页"]
+    rows = [page["content"][0]["content"][1]["content"] for page in pages["content"]]
     assert [len(page) for page in rows] == [10, 10, 1]
-    assert rows[1][0]["content"][1]["text"] == "失败 · 记录 10"
+    assert rows[1][0]["content"][1]["text"] == "记录 10"
+    plugin.data["sign_history"] = plugin.data["sign_history"][:10]
+    assert plugin.get_page()[1]["content"][2]["content"][0]["component"] == "VTable"
