@@ -20,6 +20,7 @@ export default defineConfig({
   ],
   build: {
     outDir: fileURLToPath(new URL('../../plugins.v3/nodeseekv3/dist', import.meta.url)),
+    assetsDir: 'assets/v2',
     emptyOutDir: true,
     target: 'esnext',
   },

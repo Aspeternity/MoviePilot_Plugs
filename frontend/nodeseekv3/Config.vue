@@ -1,5 +1,6 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef } from 'vue'
+import { readMoviePilotResponse } from './MoviePilotResponse'
 import { renderNodes } from './RenderNodes'
 
 const props = defineProps({
@@ -89,7 +90,8 @@ async function load() {
   loadFailed.value = false
   try {
     const id = encodeURIComponent(props.pluginId)
-    const response = await props.api.get(`plugin/form/${id}`, { feedback: 'silent', signal: controller.signal })
+    const body = await props.api.get(`plugin/form/${id}`, { feedback: 'silent', signal: controller.signal })
+    const response = readMoviePilotResponse(body)
     const form = response?.conf?.[0]
     if (form?.component !== 'VForm') throw new Error('Invalid NodeSeek configuration layout')
     Object.assign(model, response.model, { enabled: form.enabled === true, onlyonce: false })
@@ -109,11 +111,12 @@ async function checkLogin(snapshot, force) {
   let result
   try {
     const id = encodeURIComponent(props.pluginId)
-    result = await props.api.post(`plugin/${id}/config_login_check`, { ...options, force }, {
+    const body = await props.api.post(`plugin/${id}/config_login_check`, { ...options, force }, {
       feedback: 'silent',
       timeout: 60000,
       signal: controller.signal,
     })
+    result = readMoviePilotResponse(body)
     if (typeof result?.success !== 'boolean' || typeof result.message !== 'string') {
       throw new Error('Invalid NodeSeek verification response')
     }

@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build"
+    "build": "vite build",
+    "test": "node --test"
   },
   "devDependencies": {
     "@originjs/vite-plugin-federation": "1.4.1",

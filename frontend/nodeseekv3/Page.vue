@@ -1,5 +1,6 @@
 <script setup>
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { readMoviePilotResponse } from './MoviePilotResponse'
 import { renderNodes } from './RenderNodes'
 
 const props = defineProps({
@@ -18,7 +19,8 @@ async function load() {
   loadFailed.value = false
   try {
     const id = encodeURIComponent(props.pluginId)
-    const response = await props.api.get(`plugin/page/${id}`, { feedback: 'silent', signal: controller.signal })
+    const body = await props.api.get(`plugin/page/${id}`, { feedback: 'silent', signal: controller.signal })
+    const response = readMoviePilotResponse(body)
     if (!Array.isArray(response?.page)) throw new Error('Invalid NodeSeek page layout')
     page.value = response.page
   } catch {
