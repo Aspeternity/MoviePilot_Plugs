@@ -6,7 +6,7 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
 
 | 插件 | 插件 ID | 当前版本 | 最低 MoviePilot 版本 |
 | --- | --- | --- | --- |
-| NodeSeek 论坛签到 | `NodeSeekV3` | `1.6.0` | `3.2.8` |
+| NodeSeek 论坛签到 | `NodeSeekV3` | `1.6.1` | `3.2.8` |
 
 ## 安装
 
@@ -45,9 +45,9 @@ MoviePilot V3 插件仓库，由 [Aspeternity](https://github.com/Aspeternity) �
 按宿主同步间隔刷新独立快照，并在每次签到前读取 `nodeseek.com` 分组。
 云端读取失败时，本次签到失败，不回退到手动 Cookie。
 
-「验证 CookieCloud 登录」使用已保存的 User-Agent 和代理设置访问首页确认登录，
-不触发签到，也不显示 Cookie。浏览器中需先登录 NodeSeek，并同步 CookieCloud；
-同步操作本身不会续期登录状态。
+「验证 CookieCloud 登录」使用表单当前的 User-Agent 和代理设置检查登录，结果显示在按钮下方。
+验证只读，不触发签到、不显示 Cookie。定时签到在保存后才使用新的网络设置。
+请先在浏览器登录 NodeSeek，再同步 CookieCloud。同步操作本身不会续期登录状态。
 
 宿主 CookieCloud 按站点聚合子域，并丢弃原始 Cookie 的域、路径、有效期等属性；
 插件仅将目标分组注入 NodeSeek 地址。真实 Cookie 是登录凭证，

@@ -2,15 +2,18 @@
 
 from datetime import datetime, timedelta, timezone
 from http.cookies import CookieError, SimpleCookie
+import json
 import random
 import re
 import threading
-from typing import Any
+from typing import Any, TypedDict
+from urllib.parse import urlsplit
 
 from apscheduler.triggers.base import BaseTrigger
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Depends, HTTPException
+from pydantic import BaseModel, Field, StrictBool
 
 
 from app.sdk.browser import launch_browser_context
@@ -24,28 +27,77 @@ from app.schemas.types import MessageType
 
 
 _BASE_URL = "https://www.nodeseek.com"
+_SITE_HOST = urlsplit(_BASE_URL).netloc
 _BEIJING = timezone(timedelta(hours=8))
+_VERIFY_STATE_KEY = "nodeseek:cookiecloud-verification"
+_CHALLENGE_TITLES = ("just a moment", "attention required", "请稍候")
 
-_LOGIN_SCRIPT = """() => {
-  const element = document.querySelector('script#temp-script');
-  if (!element || !element.textContent.trim()) return 'unknown';
-  try {
-    const decoded = JSON.parse(new TextDecoder('utf-8').decode(
-      Uint8Array.from(atob(element.textContent.trim()), c => c.charCodeAt(0))));
-    const user = decoded && decoded.user;
-    const id = user && user.member_id;
-    const name = user && user.member_name;
-    return ((typeof id === 'number' && Number.isInteger(id) && id > 0)
-      || (typeof id === 'string' && /^[1-9]\\d*$/.test(id)))
-      && typeof name === 'string' && name.trim().length > 0 ? 'authenticated' : 'unknown';
-  } catch (_) { return 'unknown'; }
+_LOGIN_SCRIPT = r"""async () => {
+  const readUser = config => {
+    if (!config || !Object.hasOwn(config, 'user')) return 'unknown';
+    if (config.user === null || config.user === false) return 'signed_out';
+    const id = config.user?.member_id;
+    if ((Number.isSafeInteger(id) && id > 0) || (typeof id === 'string' && /^[1-9]\d*$/.test(id))) {
+      return 'authenticated';
+    }
+    return 'unknown';
+  };
+
+  for (let attempt = 0; attempt <= 10; attempt++) {
+    const current = readUser(window.__config__);
+    if (current === 'authenticated') return current;
+
+    let embedded = 'unknown';
+    const text = document.getElementById('temp-script')?.textContent.trim();
+    if (text) {
+      try {
+        const json = text.startsWith('{') ? text : new TextDecoder().decode(
+          Uint8Array.from(atob(text), char => char.charCodeAt(0)));
+        embedded = readUser(JSON.parse(json));
+      } catch (_) {
+        // 页面可能仍在初始化，稍后再检查运行时数据。
+      }
+    }
+    if (current === 'unknown' && embedded === 'authenticated') return embedded;
+    if (attempt === 10) return current === 'unknown' ? embedded : current;
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return 'unknown';
 }"""
+
+_VERIFICATION_MESSAGES = {
+    "authenticated": "已确认 NodeSeek 登录成功。",
+    "signed_out": "已读取 CookieCloud，但 NodeSeek 返回未登录。请在浏览器重新登录，再同步 CookieCloud。",
+    "unknown": "已读取 CookieCloud，但未识别到 NodeSeek 登录状态。请确认浏览器仍已登录并同步 CookieCloud。",
+    "cloud_unavailable": "无法读取 CookieCloud，请检查 MoviePilot 的 CookieCloud 设置和连接。",
+    "cookie_missing": "CookieCloud 中没有可用的 NodeSeek Cookie。请在浏览器登录 NodeSeek 后同步。",
+    "proxy_missing": "MoviePilot 尚未配置系统代理。请先配置代理，或关闭代理后重新验证。",
+    "blocked": "NodeSeek 拒绝访问或要求站点验证。请在浏览器确认能正常访问后重试。",
+    "redirected": "NodeSeek 跳转到了其他网站。请检查网络和代理设置后重试。",
+    "network_error": "无法正常访问 NodeSeek。请检查 MoviePilot 的网络或代理后重试。",
+    "browser_error": "MoviePilot 无法启动浏览器，请检查宿主浏览器环境后重试。",
+}
+
+
+class CookieCloudVerificationOptions(BaseModel):
+    """仅用于本次验证的网络设置，缺省字段沿用已保存配置。"""
+
+    use_proxy: StrictBool | None = None
+    user_agent: str | None = Field(default=None, max_length=1024)
+
+
+class CookieCloudVerificationResult(TypedDict):
+    """提供给配置页的脱敏验证结果。"""
+
+    success: bool
+    status: str
+    message: str
 
 
 def _require_administrator(token: schemas.TokenPayload = Depends(verify_token)) -> None:
-    """仅允许管理员访问包含登录凭据的接口。"""
+    """仅允许管理员验证 CookieCloud 登录。"""
     if token.super_user is not True:
-        raise HTTPException(status_code=403, detail="仅管理员可获取 NodeSeek Cookie")
+        raise HTTPException(status_code=403, detail="仅管理员可验证 NodeSeek 登录")
 
 
 def _download_cookiecloud() -> tuple[dict[str, str] | None, str]:
@@ -149,7 +201,7 @@ class NodeSeekV3(_PluginBase):
     plugin_name = "NodeSeek 论坛签到"
     plugin_desc = "通过 MoviePilot 浏览器定时执行 NodeSeek 论坛签到。"
     plugin_icon = ""
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_label = "站点签到"
     plugin_author = "Aspeternity"
     author_url = "https://github.com/Aspeternity"
@@ -206,13 +258,14 @@ class NodeSeekV3(_PluginBase):
         """注册需要管理员身份的 CookieCloud 登录验证接口。"""
         return [{"path": "/cookiecloud_verify", "endpoint": self.verify_cookiecloud_login,
                  "methods": ["POST"], "auth": "bear", "dependencies": [Depends(_require_administrator)],
+                 "response_model": CookieCloudVerificationResult,
                  "summary": "验证 CookieCloud 登录"}]
 
     def _cloud_cookie(self) -> tuple[str, str | None]:
         """读取目标域 Cookie；仅在调用链内返回原值，失败时返回固定状态。"""
         try:
             groups, error = _download_cookiecloud()
-            if error or not isinstance(groups, dict) or not groups:
+            if error or not isinstance(groups, dict):
                 return "unavailable", None
             source = groups.get("nodeseek.com")
             if not isinstance(source, str) or not self._cookies(source):
@@ -221,44 +274,87 @@ class NodeSeekV3(_PluginBase):
         except Exception:
             return "unavailable", None
 
-    def verify_cookiecloud_login(self) -> dict[str, Any]:
-        """验证云端 Cookie 的登录状态，不返回凭据，也不执行签到。"""
+    @staticmethod
+    def _route_verification_request(route: Any) -> None:
+        """仅允许 NodeSeek 首页和初始化页面所需的同源脚本。"""
+        request = route.request
+        url = urlsplit(request.url)
+        if url.scheme == "https" and url.netloc == _SITE_HOST and request.method in ("GET", "HEAD"):
+            if request.is_navigation_request() and url.path == "/" and not url.query:
+                route.continue_()
+                return
+            if request.resource_type == "script" and not url.path.startswith(("/api/", "/cdn-cgi/")):
+                route.continue_()
+                return
+        route.abort()
+
+    @staticmethod
+    def _verification_status(page: Any, response: Any) -> str:
+        """从站点响应和当前用户标记得出脱敏状态。"""
+        if response is None:
+            return "network_error"
+        url = urlsplit(page.url)
+        if url.scheme != "https" or url.netloc != _SITE_HOST:
+            return "redirected"
+        if (
+            response.status in (403, 429)
+            or response.headers.get("cf-mitigated") == "challenge"
+            or any(marker in page.title().lower() for marker in _CHALLENGE_TITLES)
+        ):
+            return "blocked"
+        if response.status == 401:
+            return "signed_out"
+        if not response.ok:
+            return "network_error"
+        status = page.evaluate(_LOGIN_SCRIPT)
+        return status if status in ("authenticated", "signed_out") else "unknown"
+
+    @staticmethod
+    def _verification_result(status: str) -> CookieCloudVerificationResult:
+        """记录固定状态，避免把站点响应或浏览器异常写进日志。"""
+        logger.info("NodeSeek CookieCloud 验证结果：%s", status)
+        return {
+            "success": status == "authenticated",
+            "status": status,
+            "message": _VERIFICATION_MESSAGES[status],
+        }
+
+    def verify_cookiecloud_login(
+        self, options: CookieCloudVerificationOptions | None = None
+    ) -> CookieCloudVerificationResult:
+        """使用本次表单网络设置检查 CookieCloud 登录状态。"""
         status, source = self._cloud_cookie()
         if status != "found" or source is None:
-            message = ("CookieCloud 读取失败，请检查 MoviePilot 的 CookieCloud 设置。" if status == "unavailable"
-                       else "未找到 NodeSeek Cookie，请先在浏览器登录并同步 CookieCloud。")
-            return {"success": False, "message": message}
-        options: dict[str, Any] = {"headless": True}
-        if self._config.get("user_agent"):
-            options["user_agent"] = str(self._config["user_agent"]).strip()
-        if self._config.get("use_proxy"):
+            return self._verification_result("cloud_unavailable" if status == "unavailable" else "cookie_missing")
+        network = options.model_dump(exclude_none=True) if options is not None else {}
+        user_agent = str(network.get("user_agent", self._config.get("user_agent")) or "").strip()
+        use_proxy = network.get("use_proxy", self._config.get("use_proxy"))
+        browser_options: dict[str, Any] = {"headless": True, "service_workers": "block"}
+        if user_agent:
+            browser_options["user_agent"] = user_agent
+        if use_proxy:
             proxy = getattr(settings, "PROXY_SERVER", None)
             if not proxy:
-                return {"success": False, "message": "已启用代理，但 MoviePilot 未配置代理地址。"}
-            options["proxy"] = proxy
-        context = None
+                return self._verification_result("proxy_missing")
+            browser_options["proxy"] = proxy
+
         try:
-            context = launch_browser_context(**options)
-            context.add_cookies(self._cookies(source))
-            page = context.new_page()
-            page.route("**/*", lambda route: route.continue_() if route.request.method.upper() in ("GET", "HEAD")
-                       and route.request.is_navigation_request() else route.abort())
-            page.set_default_timeout(60000)
-            response = page.goto(_BASE_URL + "/", wait_until="domcontentloaded", timeout=60000)
-            diagnostic = self._page_diagnostic(page, response)
-            if diagnostic:
-                return {"success": False, "message": diagnostic}
-            if page.evaluate(_LOGIN_SCRIPT) == "authenticated":
-                return {"success": True, "message": "CookieCloud 登录验证成功。"}
-            return {"success": False, "message": "无法确认 NodeSeek 登录状态，请检查 Cookie 是否失效或站点页面是否变化。"}
+            context = launch_browser_context(**browser_options)
         except Exception:
-            return {"success": False, "message": "登录验证失败，请检查浏览器环境、网络或站点验证。"}
+            return self._verification_result("browser_error")
+        try:
+            context.add_cookies(self._cookies(source))
+            context.route("**/*", self._route_verification_request)
+            page = context.new_page()
+            response = page.goto(_BASE_URL + "/", wait_until="domcontentloaded", timeout=15000)
+            return self._verification_result(self._verification_status(page, response))
+        except Exception:
+            return self._verification_result("network_error")
         finally:
-            if context is not None:
-                try:
-                    context.close()
-                except Exception:
-                    logger.warning("NodeSeek 浏览器上下文关闭失败")
+            try:
+                context.close()
+            except Exception:
+                logger.warning("NodeSeek 浏览器上下文关闭失败")
 
     def get_service(self) -> list[dict[str, Any]]:
         """按配置注册签到及独立的 CookieCloud 同步任务。"""
@@ -338,7 +434,7 @@ class NodeSeekV3(_PluginBase):
             title = page.title().lower()
         except Exception:
             title = ""
-        if any(marker in title for marker in ("just a moment", "attention required", "请稍候")):
+        if any(marker in title for marker in _CHALLENGE_TITLES):
             return "检测到可能的站点验证页面，请在浏览器中人工处理后检查 Cookie"
         if not response.ok:
             status = getattr(response, "status", None)
@@ -504,6 +600,112 @@ class NodeSeekV3(_PluginBase):
         last = self.get_data("last_result")
         return [dict(last)] if isinstance(last, dict) and last else []
 
+    def _account_form(self) -> dict[str, Any]:
+        """呈现登录方式、实时验证结果和可折叠的网络设置。"""
+        verify_path = json.dumps(f"plugin/{self.__class__.__name__}/cookiecloud_verify")
+        state_key = json.dumps(_VERIFY_STATE_KEY)
+        state = f"model[Symbol.for({state_key})]"
+        agent = "String(model.user_agent || '').trim()"
+        proxy_enabled = "(model.use_proxy === true)"
+        verify_click = f"""async function() {{
+          const key = Symbol.for({state_key});
+          if (model.cookiecloud !== true || model[key]?.loading) return;
+
+          const network = {{use_proxy: {proxy_enabled}, user_agent: {agent}}};
+          model[key] = {{network, loading: true}};
+          try {{
+            const result = await window.MoviePilotAPI.post(
+              {verify_path}, network, {{feedback: 'silent', timeout: 60000}});
+            if (typeof result?.success !== 'boolean' || typeof result.message !== 'string') {{
+              throw new TypeError('Unexpected verification response');
+            }}
+            const type = result.success ? 'success' :
+              ['signed_out', 'unknown', 'cookie_missing', 'proxy_missing'].includes(result.status) ? 'warning' : 'error';
+            model[key] = {{network, loading: false, type, message: result.message}};
+          }} catch (_) {{
+            model[key] = {{network, loading: false, type: 'error',
+              message: '未收到验证结果。请检查 MoviePilot 连接后重试。'}};
+          }}
+        }}"""
+        current_result = (
+            f"{state}?.message && {state}.network.use_proxy === {proxy_enabled} "
+            f"&& {state}.network.user_agent === {agent}"
+        )
+        return self._card("登录与网络", "mdi-shield-account-outline", [
+            {"component": "div", "props": {"class": "text-subtitle-2 font-weight-medium mb-2"}, "text": "登录方式"},
+            {"component": "VBtnToggle", "props": {
+                "model": "cookiecloud", "mandatory": True, "color": "primary", "variant": "outlined",
+                "density": "comfortable", "rounded": "lg", "class": "w-100 h-auto flex-column flex-sm-row mb-4",
+                "aria-label": "登录方式",
+            }, "content": [
+                {"component": "VBtn", "props": {
+                    "value": True, "prepend-icon": "mdi-cloud-outline", "height": 44,
+                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
+                    "type": "button", "aria-pressed": "{{cookiecloud}}",
+                }, "text": "CookieCloud"},
+                {"component": "VBtn", "props": {
+                    "value": False, "prepend-icon": "mdi-key-outline", "height": 44,
+                    "class": "flex-grow-1 text-none text-body-2 font-weight-medium",
+                    "type": "button", "aria-pressed": "{{!cookiecloud}}",
+                }, "text": "手动 Cookie"},
+            ]},
+            {"component": "div", "props": {"show": "{{!cookiecloud}}", "class": "mb-4"}, "content": [
+                {"component": "VTextField", "props": {
+                    "model": "cookie", "label": "NodeSeek Cookie", "type": "password", "autocomplete": "off",
+                    "hide-details": True, "variant": "outlined",
+                }},
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                 "text": "粘贴已登录浏览器的 NodeSeek Cookie。Cookie 是登录凭据，请妥善保管。"},
+            ]},
+            {"component": "div", "props": {"show": "{{cookiecloud}}", "class": "mb-4"}, "content": [
+                {"component": "p", "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
+                 "text": "使用 MoviePilot 的 CookieCloud。验证采用下方当前网络设置，仅检查登录。"},
+                {"component": "VBtn", "props": {
+                    "color": "primary", "variant": "tonal", "class": "text-none", "type": "button",
+                    "prepend-icon": "mdi-shield-check-outline", "onclick": verify_click,
+                    "loading": f"{{{{Boolean({state}?.loading)}}}}", "disabled": f"{{{{Boolean({state}?.loading)}}}}",
+                    "aria-busy": f"{{{{Boolean({state}?.loading)}}}}",
+                }, "text": "验证 CookieCloud 登录"},
+                {"component": "div", "props": {"role": "status", "aria-live": "polite"}, "content": [
+                    {"component": "p", "props": {
+                        "show": f"{{{{Boolean({state}?.loading)}}}}", "class": "text-caption mt-2",
+                    }, "text": "正在验证登录…"},
+                    {"component": "VAlert", "props": {
+                        "show": f"{{{{Boolean({current_result})}}}}", "type": f"{{{{{state}?.type || 'info'}}}}",
+                        "variant": "tonal", "density": "compact", "class": "mt-3",
+                    }, "content": [
+                        {"component": "span", "props": {"textContent": f"{{{{{state}?.message || ''}}}}"}},
+                    ]},
+                ]},
+            ]},
+            {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
+                {"component": "VExpansionPanel", "props": {"elevation": 0, "class": "border rounded-lg"}, "content": [
+                    {"component": "VExpansionPanelTitle", "props": {"class": "px-4"}, "content": [
+                        {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
+                         "text": "mdi-lan-connect"},
+                        {"component": "span", "props": {"class": "font-weight-medium"}, "text": "网络设置"},
+                        {"component": "VChip", "props": {"size": "small", "variant": "tonal", "class": "ml-3"},
+                         "content": [{"component": "span", "props": {
+                             "textContent": "{{use_proxy ? '使用系统代理' : '直连'}}",
+                         }}]},
+                    ]},
+                    {"component": "VExpansionPanelText", "content": [
+                        {"component": "VSwitch", "props": {
+                            "model": "use_proxy", "label": "使用 MoviePilot 系统代理", "color": "primary",
+                            "hide-details": True,
+                        }},
+                        {"component": "VTextField", "props": {
+                            "model": "user_agent", "label": "浏览器 User-Agent", "variant": "outlined",
+                            "hint": "可选。留空使用宿主浏览器的默认值。", "persistent-hint": True,
+                            "maxlength": 1024, "class": "mt-2",
+                        }},
+                        {"component": "p", "props": {"class": "text-caption text-medium-emphasis mt-2"},
+                         "text": "保存后，定时签到才会使用新的网络设置。"},
+                    ]},
+                ]},
+            ]},
+        ])
+
     def get_form(self) -> tuple[list[dict], dict[str, Any]]:
         """返回分组的 Vuetify JSON 配置表单，兼容既有模型。"""
         col = self._col
@@ -532,33 +734,7 @@ class NodeSeekV3(_PluginBase):
             {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mt-3", "show": "{{schedule_mode == 'window'}}",
              "text": "随机时段仅支持同一天内的 HH:MM，开始必须早于结束；重启时在剩余时段内重新抽取，错过时段则等待次日。"}},
         ])
-        verify_path = f"plugin/{self.__class__.__name__}/cookiecloud_verify"
-        verify_click = ("function(e) { if (!model.cookiecloud || model._nodeseek_cloud_verifying) return; "
-                        "model._nodeseek_cloud_verifying = true; "
-                        f"window.MoviePilotAPI.post('{verify_path}', {{}}, {{feedback: 'silent'}})"
-                        ".then(function(r) { if (model.cookiecloud) alert((r && r.message) || '无法确认登录状态。') })"
-                        ".catch(function() { alert('登录验证失败，请检查网络或 CookieCloud。') })"
-                        ".finally(function() { model._nodeseek_cloud_verifying = false }) }")
-        account = self._card("登录与网络", "mdi-shield-account-outline", [
-            row([col("VSelect", "cookiecloud", "Cookie 来源", 12, items=[
-                {"title": "手动输入 Cookie", "value": False},
-                {"title": "同步 CookieCloud", "value": True}])]),
-            {"component": "VRow", "props": {"show": "{{!cookiecloud}}"}, "content": [
-                col("VTextField", "cookie", "NodeSeek Cookie", 12, type="password", autocomplete="off", required=True)]},
-            {"component": "VRow", "props": {"show": "{{cookiecloud}}"}, "content": [
-                {"component": "VCol", "props": {"cols": 12}, "content": [
-                    {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "class": "mb-3",
-                     "text": "使用 MoviePilot 的 CookieCloud 配置。签到时读取最新 Cookie；验证不会执行签到，并使用已保存的网络设置。"}},
-                    {"component": "VBtn", "props": {"color": "primary", "variant": "tonal",
-                     "prepend-icon": "mdi-shield-check-outline", "disabled": "{{_nodeseek_cloud_verifying}}",
-                     "onclick": verify_click}, "text": "验证 CookieCloud 登录"}]}]},
-            row([col("VTextField", "user_agent", "浏览器 User-Agent（可选）", 12),
-                 col("VSwitch", "use_proxy", "使用 MoviePilot 系统代理", 12, color="primary")]),
-            {"component": "VAlert", "props": {"type": "warning", "variant": "tonal",
-             "text": "Cookie 是登录凭证，请勿分享。登录失效或站点验证可能需要在浏览器中人工处理。"}},
-        ])
         defaults = dict(self._defaults)
-        defaults["_nodeseek_cloud_verifying"] = False
         for key in ("window_start", "window_end"):
             value = self._config.get(key)
             if isinstance(value, str) and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
@@ -566,7 +742,7 @@ class NodeSeekV3(_PluginBase):
             else:
                 defaults[f"{key}_hour"] = None
                 defaults[f"{key}_minute"] = None
-        return [{"component": "VForm", "content": [basic, schedule, account]}], defaults
+        return [{"component": "VForm", "content": [basic, schedule, self._account_form()]}], defaults
 
     def get_page(self) -> list[dict]:
         """以卡片显示最近结果和当前计划，不显示 Cookie。"""

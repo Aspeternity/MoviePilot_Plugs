@@ -87,11 +87,12 @@ def plugin_module(monkeypatch):
 class FakePage:
     """模拟浏览器页面及指定站点返回。"""
 
-    def __init__(self, result, url="https://www.nodeseek.com/"):
+    def __init__(self, result, url="https://www.nodeseek.com/", status=200, headers=None):
         """配置页面结果和地址。"""
         self.result = result
         self.url = url
         self.evaluated = False
+        self.response = types.SimpleNamespace(ok=200 <= status < 300, status=status, headers=headers or {})
 
     def set_default_timeout(self, timeout):
         """记录页面超时。"""
@@ -99,11 +100,7 @@ class FakePage:
 
     def goto(self, url, **kwargs):
         """模拟访问首页。"""
-        return types.SimpleNamespace(ok=True)
-
-    def route(self, pattern, handler):
-        """记录只读请求过滤器。"""
-        self.route_handler = handler
+        return self.response
 
     def title(self):
         """返回正常页面标题。"""
@@ -128,6 +125,10 @@ class FakeContext:
     def add_cookies(self, cookies):
         """记录限定域名的 Cookie。"""
         self.cookies = cookies
+
+    def route(self, pattern, handler):
+        """记录上下文的只读请求过滤器。"""
+        self.route_handler = handler
 
     def new_page(self):
         """返回模拟页面。"""
@@ -277,7 +278,10 @@ def test_cookiecloud_host_facade_contract(plugin_module, monkeypatch):
     assert plugin_module._download_cookiecloud() == ({"nodeseek.com": "session=example"}, "")
 
 
-@pytest.mark.parametrize("observed,expected", [("authenticated", True), ("unknown", False), (None, False), (True, False)])
+@pytest.mark.parametrize("observed,expected", [
+    ("authenticated", "authenticated"), ("signed_out", "signed_out"),
+    ("unknown", "unknown"), (None, "unknown"), (True, "unknown"),
+])
 def test_verify_login_requires_explicit_evidence_and_is_read_only(plugin_module, monkeypatch, observed, expected):
     """只有明确登录证据才成功，验证不执行签到或更改配置。"""
     plugin = plugin_module.NodeSeekV3()
@@ -289,25 +293,49 @@ def test_verify_login_requires_explicit_evidence_and_is_read_only(plugin_module,
     monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: context)
     monkeypatch.setattr(plugin, "sign", lambda: pytest.fail("不得签到"))
     result = plugin.verify_cookiecloud_login()
-    assert result["success"] is expected and context.closed and page.evaluated
+    assert result["status"] == expected
+    assert result["success"] is (expected == "authenticated") and context.closed and page.evaluated
     assert plugin._config == before and not plugin.data and not hasattr(plugin, "saved_config")
     assert "secret" not in repr(result) + repr(plugin_module.logger.messages)
+    assert context.route_handler == plugin._route_verification_request
+
+
+@pytest.mark.parametrize("method,url,resource_type,expected", [
+    ("GET", "https://www.nodeseek.com/", "document", "allow"),
+    ("GET", "https://www.nodeseek.com/assets/app.js", "script", "allow"),
+    ("POST", "https://www.nodeseek.com/api/attendance", "fetch", "abort"),
+    ("GET", "https://www.nodeseek.com/api/attendance", "fetch", "abort"),
+    ("GET", "https://www.nodeseek.com/api/attendance", "script", "abort"),
+    ("GET", "https://www.nodeseek.com/cdn-cgi/challenge-platform/script.js", "script", "abort"),
+    ("GET", "https://www.nodeseek.com.example/assets/app.js", "script", "abort"),
+])
+def test_verification_routes_are_limited_to_reading_the_page(plugin_module, method, url, resource_type, expected):
     calls = []
-    for method, navigation in (("GET", True), ("HEAD", True), ("POST", True), ("PUT", True), ("GET", False)):
-        route = types.SimpleNamespace(request=types.SimpleNamespace(method=method, is_navigation_request=lambda: navigation),
-                                      continue_=lambda: calls.append("allow"), abort=lambda: calls.append("abort"))
-        page.route_handler(route)
-    assert calls == ["allow", "allow", "abort", "abort", "abort"]
+    route = types.SimpleNamespace(
+        request=types.SimpleNamespace(
+            url=url, method=method, resource_type=resource_type,
+            is_navigation_request=lambda: resource_type == "document",
+        ),
+        continue_=lambda: calls.append("allow"),
+        abort=lambda: calls.append("abort"),
+    )
+    plugin_module.NodeSeekV3._route_verification_request(route)
+    assert calls == [expected]
 
 
-@pytest.mark.parametrize("response", [(None, "secret"), ({}, ""), ({"other.example": "session=secret"}, ""),
-                                       ({"nodeseek.com": "invalid cookie text"}, "")])
-def test_verify_cloud_failure_no_browser_or_leak(plugin_module, monkeypatch, response):
+@pytest.mark.parametrize("response,expected", [
+    ((None, "secret"), "cloud_unavailable"),
+    (({}, ""), "cookie_missing"),
+    (({"other.example": "session=secret"}, ""), "cookie_missing"),
+    (({"nodeseek.com": "invalid cookie text"}, ""), "cookie_missing"),
+])
+def test_verify_cloud_failure_no_browser_or_leak(plugin_module, monkeypatch, response, expected):
     """云端读取失败不会启动浏览器，错误详情不会泄露。"""
     plugin = plugin_module.NodeSeekV3()
     monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: response)
     monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: pytest.fail("不得启动浏览器"))
     result = plugin.verify_cookiecloud_login()
+    assert result["status"] == expected
     assert not result["success"] and "secret" not in repr(result)
 
 
@@ -318,17 +346,62 @@ def test_verify_challenge_redirect_and_exception(plugin_module, monkeypatch):
     page = FakePage("authenticated", url="https://evil.example/")
     context = FakeContext(page)
     monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: context)
-    assert not plugin.verify_cookiecloud_login()["success"] and context.closed and not page.evaluated
+    assert plugin.verify_cookiecloud_login()["status"] == "redirected" and context.closed and not page.evaluated
     page = FakePage("authenticated")
     page.title = lambda: "Just a moment..."
     context = FakeContext(page)
     monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: context)
-    assert not plugin.verify_cookiecloud_login()["success"] and context.closed and not page.evaluated
+    assert plugin.verify_cookiecloud_login()["status"] == "blocked" and context.closed and not page.evaluated
     def fail(**kwargs):
         """模拟泄露敏感内容的浏览器异常。"""
         raise RuntimeError("secret")
     monkeypatch.setattr(plugin_module, "launch_browser_context", fail)
-    assert "secret" not in repr(plugin.verify_cookiecloud_login())
+    result = plugin.verify_cookiecloud_login()
+    assert result["status"] == "browser_error" and "secret" not in repr(result)
+
+
+@pytest.mark.parametrize("status,headers,expected", [
+    (401, {}, "signed_out"),
+    (403, {}, "blocked"),
+    (200, {"cf-mitigated": "challenge"}, "blocked"),
+    (502, {}, "network_error"),
+])
+def test_verify_http_errors_do_not_read_page_login_marker(plugin_module, monkeypatch, status, headers, expected):
+    plugin = plugin_module.NodeSeekV3()
+    monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: ({"nodeseek.com": "session=example"}, ""))
+    page = FakePage("authenticated", status=status, headers=headers)
+    context = FakeContext(page)
+    monkeypatch.setattr(plugin_module, "launch_browser_context", lambda **kwargs: context)
+
+    result = plugin.verify_cookiecloud_login()
+
+    assert result["status"] == expected and not result["success"]
+    assert context.closed and not page.evaluated
+
+
+def test_verify_uses_current_network_options_without_saving(plugin_module, monkeypatch):
+    plugin = plugin_module.NodeSeekV3()
+    plugin.init_plugin({"use_proxy": True, "user_agent": "saved-agent"})
+    monkeypatch.setattr(plugin_module, "_download_cookiecloud", lambda: ({"nodeseek.com": "session=example"}, ""))
+    calls = []
+
+    def launch(**options):
+        calls.append(options)
+        return FakeContext(FakePage("authenticated"))
+
+    monkeypatch.setattr(plugin_module, "launch_browser_context", launch)
+    assert plugin.verify_cookiecloud_login()["status"] == "proxy_missing"
+    assert not calls
+    network = plugin_module.CookieCloudVerificationOptions(use_proxy=False, user_agent=" draft-agent ")
+    assert plugin.verify_cookiecloud_login(network)["success"]
+    assert calls[-1] == {"headless": True, "service_workers": "block", "user_agent": "draft-agent"}
+
+    monkeypatch.setattr(plugin_module.settings, "PROXY_SERVER", "http://proxy.example:8080")
+    network = plugin_module.CookieCloudVerificationOptions(user_agent="")
+    assert plugin.verify_cookiecloud_login(network)["success"]
+    assert calls[-1] == {"headless": True, "service_workers": "block", "proxy": "http://proxy.example:8080"}
+    assert plugin._config["use_proxy"] is True and plugin._config["user_agent"] == "saved-agent"
+    assert not hasattr(plugin, "saved_config")
 
 
 def test_cookiecloud_fallback_does_not_mask_signin_result(plugin_module, monkeypatch):
@@ -363,13 +436,16 @@ def test_cookiecloud_source_config_ui(plugin_module):
     cards = form[0]["content"]
     assert cards[1]["content"][0]["content"][1]["text"] == "签到计划"
     account = cards[2]["content"][2]["content"]
-    select = account[0]["content"][0]["content"][0]
-    assert select["component"] == "VSelect" and select["props"]["model"] == "cookiecloud"
-    assert [item["value"] for item in select["props"]["items"]] == [False, True]
-    assert account[1]["props"]["show"] == "{{!cookiecloud}}" and account[2]["props"]["show"] == "{{cookiecloud}}"
-    button = account[2]["content"][0]["content"][1]
+    toggle = next(node for node in account if node["component"] == "VBtnToggle")
+    assert toggle["props"]["model"] == "cookiecloud"
+    assert {button["props"]["value"] for button in toggle["content"]} == {False, True}
+    manual = next(node for node in account if node["props"].get("show") == "{{!cookiecloud}}")
+    assert manual["content"][0]["props"]["type"] == "password"
+    cloud = next(node for node in account if node["props"].get("show") == "{{cookiecloud}}")
+    button = next(node for node in cloud["content"] if node["component"] == "VBtn")
     assert button["text"] == "验证 CookieCloud 登录" and "cookiecloud_verify" in button["props"]["onclick"]
-    assert defaults["_nodeseek_cloud_verifying"] is False
+    assert any(node["component"] == "VExpansionPanels" for node in account)
+    assert "alert(" not in button["props"]["onclick"] and "_nodeseek_cloud_verifying" not in defaults
     assert "CookieCloud 检测" not in json.dumps(plugin.get_page(), ensure_ascii=False)
     for value in (False, True):
         plugin.init_plugin({"cookiecloud": value, "cookie": "session=manual", "custom": "keep"})
