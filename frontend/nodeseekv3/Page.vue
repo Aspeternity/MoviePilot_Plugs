@@ -61,9 +61,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <PluginDialog section="论坛签到" @close="emit('close')">
-    <div v-if="loading"><VProgressLinear indeterminate aria-label="正在加载签到数据" /></div>
-    <div v-else-if="loadFailed">
+  <PluginDialog view="data" :loading="loading" @close="emit('close')">
+    <div v-if="loadFailed">
       <VAlert type="error" title="数据加载失败">
         <div>签到数据加载失败，请重试。</div>
         <VBtn class="mt-3" color="error" variant="tonal" @click="load">重试</VBtn>

@@ -176,3 +176,24 @@
 @media (pointer: coarse) {
   .ns-nav button, .ns-choice button, .ns-edit-foot button, .ns-network summary { min-height: 44px; }
 }
+
+.ns-ticket-dialog.ns-awaiting-open, .ns-ticket-dialog:has(.ns-awaiting-open) { visibility: hidden; }
+.ns-reserved-data { height: var(--ns-reserved-height, 43rem); }
+.ns-reserved-config { min-height: 360px; }
+.ns-reserved-data > .ns-placeholder { height: 100%; overflow: hidden; }
+.ns-skeleton-ticket { height: 147px; border-radius: 14px; background: var(--ns-soft); }
+.ns-skeleton-line, .ns-skeleton-row::before {
+  display: block; width: min(100%, 8rem); height: 10px; border-radius: 5px; background: var(--ns-soft);
+}
+.ns-placeholder .ns-nav .ns-skeleton-line { margin-block: 12px; }
+.ns-placeholder .ns-timing .ns-skeleton-line { align-self: center; }
+.ns-skeleton-row { display: flex; align-items: center; height: 36px; border-bottom: 1px solid var(--ns-line); }
+.ns-skeleton-row::before { content: ''; width: 42%; }
+.ns-placeholder .ns-edit .ns-skeleton-row { height: 48px; }
+.ns-placeholder .ns-activity > .ns-skeleton-line { margin-block: 12px 18px; }
+.ns-ua-field { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.ns-ua-field .ns-field { margin: 0; flex: 1 1 12rem; }
+.ns-ua-notice:empty { display: none; }
+@container (max-width: 520px) {
+  .ns-reserved-config { min-height: 355px; }
+}

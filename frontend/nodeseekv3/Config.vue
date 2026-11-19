@@ -25,6 +25,7 @@ const switches = [
 const loading = ref(true)
 const loadFailed = ref(false)
 const checking = ref('')
+const uaNotice = ref('')
 const verification = shallowRef(null)
 const initialNotice = ref('')
 const savedLogin = ref(null)
@@ -58,10 +59,21 @@ function update(field, value) {
   }
   const previousScope = currentScope.value
   model[field] = value
+  if (field === 'user_agent') uaNotice.value = ''
   if (currentScope.value !== previousScope) {
     verification.value = null
     touchedLogin.value = true
   }
+}
+
+function fillBrowserUA() {
+  const ua = navigator.userAgent?.trim()
+  if (!ua || ua.length > 1024) {
+    uaNotice.value = ua ? '当前浏览器 UA 超过 1024 个字符，请手动填写。' : '未读取到当前浏览器 UA，请手动填写。'
+    return
+  }
+  update('user_agent', ua)
+  uaNotice.value = '已填入当前浏览器 UA。'
 }
 
 function timeText(key) {
@@ -182,11 +194,8 @@ onUnmounted(() => controller.abort())
 </script>
 
 <template>
-  <PluginDialog section="插件配置" @close="emit('close')">
-    <div v-if="loading">
-      <VProgressLinear indeterminate aria-label="正在加载配置" />
-    </div>
-    <div v-else-if="loadFailed">
+  <PluginDialog view="config" :loading="loading" @close="emit('close')">
+    <div v-if="loadFailed">
       <VAlert type="error" title="配置加载失败">
         <div>插件配置加载失败，请稍后重试</div>
         <VBtn class="mt-3" color="error" variant="tonal" @click="load">重试</VBtn>
@@ -253,10 +262,14 @@ onUnmounted(() => controller.abort())
               <label class="ns-setting"><span>使用 MoviePilot 系统代理</span>
                 <input type="checkbox" class="ns-switch" :checked="model.use_proxy" @change="update('use_proxy', $event.target.checked)" />
               </label>
-              <label class="ns-field">浏览器 User-Agent
-                <input type="text" maxlength="1024" placeholder="使用宿主默认值" :value="model.user_agent"
-                       @input="update('user_agent', $event.target.value)" />
-              </label>
+              <div class="ns-ua-field">
+                <label class="ns-field">浏览器 User-Agent
+                  <input type="text" maxlength="1024" placeholder="使用宿主默认值" :value="model.user_agent"
+                         @input="update('user_agent', $event.target.value)" />
+                </label>
+                <button type="button" class="ns-secondary" @click="fillBrowserUA">填入当前浏览器 UA</button>
+              </div>
+              <p role="status" aria-live="polite" class="ns-ua-notice ns-hint">{{ uaNotice }}</p>
             </details>
           </template>
         </fieldset>
