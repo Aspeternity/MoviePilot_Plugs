@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef } from 'vue'
 import { readMoviePilotResponse } from './MoviePilotResponse'
+import PluginDialog from './PluginDialog.vue'
 import { renderNodes } from './RenderNodes'
 
 const props = defineProps({
@@ -76,12 +77,12 @@ const bindings = computed(() => {
     useCloud: cloud,
     useManual: !cloud,
     proxyLabel: model.use_proxy ? '使用系统代理' : '直连',
-    verifyLabel: cloud ? '验证 CookieCloud 登录' : '验证手动 Cookie',
     verifying: checking.value === 'verify',
+    checkingLogin: Boolean(checking.value),
     busy: Boolean(checking.value),
-    needsLogin: Boolean((model.enabled || model.onlyonce) && !verified),
-    loginMessage: checking.value ? '正在验证 NodeSeek 登录…' : result?.message || (!touchedLogin.value && initialNotice.value) || '',
-    loginAlertType: checking.value ? 'info' : result?.success ? 'success' : 'warning',
+    needsLogin: !verified,
+    loginMessage: checking.value ? '' : result?.message || (!touchedLogin.value && initialNotice.value) || '',
+    loginAlertType: result?.success ? 'success' : result?.type || 'warning',
   }
 })
 
@@ -123,7 +124,8 @@ async function checkLogin(snapshot, force) {
   } catch {
     result = { success: false, message: '未收到登录验证结果。请检查 MoviePilot 连接后重试。' }
   }
-  verification.value = { ...result, scope }
+  const warning = ['signed_out', 'unknown', 'cookie_missing', 'manual_missing', 'manual_invalid', 'proxy_missing']
+  verification.value = { ...result, scope, type: warning.includes(result.status) ? 'warning' : 'error' }
   return result.success && !controller.signal.aborted
 }
 
@@ -174,29 +176,26 @@ onUnmounted(() => controller.abort())
 </script>
 
 <template>
-  <div ref="root">
-    <VCardTitle class="d-flex align-center justify-space-between">
-      NodeSeek 论坛签到 · 插件配置
-      <VBtn icon="mdi-close" variant="text" aria-label="关闭" @click="emit('close')" />
-    </VCardTitle>
-    <VDivider />
-    <VCardText v-if="loading">
+  <PluginDialog title="NodeSeek 论坛签到 - 插件配置" divider @close="emit('close')">
+    <div v-if="loading">
       <VProgressLinear indeterminate aria-label="正在加载配置" />
-    </VCardText>
-    <VCardText v-else-if="loadFailed">
-      <VAlert type="error" variant="tonal">配置加载失败，请重试。</VAlert>
-      <VBtn class="mt-3" variant="tonal" @click="load">重试</VBtn>
-    </VCardText>
-    <VCardText v-else>
-      <fieldset :disabled="Boolean(checking)" class="pa-0 ma-0" style="border: 0; min-inline-size: 0">
-        <Layout />
-      </fieldset>
-    </VCardText>
-    <VCardActions class="app-dialog-actions">
-      <VBtn color="info" variant="tonal" prepend-icon="mdi-database-eye-outline" @click="emit('switch')">查看数据</VBtn>
-      <VSpacer />
-      <VBtn color="primary" variant="flat" prepend-icon="mdi-content-save"
-            :disabled="!layout || Boolean(checking)" :loading="checking === 'save'" @click="save">保存</VBtn>
-    </VCardActions>
-  </div>
+    </div>
+    <div v-else-if="loadFailed">
+      <VAlert type="error" title="配置加载失败">
+        <div>插件配置加载失败，请稍后重试</div>
+        <VBtn class="mt-3" color="error" variant="tonal" @click="load">重试</VBtn>
+      </VAlert>
+    </div>
+    <fieldset v-else ref="root" :disabled="Boolean(checking)" class="pa-0 ma-0" style="border: 0; min-inline-size: 0">
+      <Layout />
+    </fieldset>
+    <template #actions>
+      <VCardActions class="app-dialog-actions">
+        <VBtn color="info" variant="tonal" prepend-icon="mdi-database-eye-outline" @click="emit('switch')">查看数据</VBtn>
+        <VSpacer />
+        <VBtn v-if="layout" color="primary" variant="flat" prepend-icon="mdi-content-save" class="px-5"
+              :disabled="Boolean(checking)" :loading="checking === 'save'" @click="save">保存</VBtn>
+      </VCardActions>
+    </template>
+  </PluginDialog>
 </template>

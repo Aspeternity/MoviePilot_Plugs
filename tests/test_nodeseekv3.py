@@ -594,9 +594,10 @@ def test_cookiecloud_source_config_ui(plugin_module):
     assert {button["props"]["value"] for button in toggle["content"]} == {False, True}
     manual = next(node for node in account if node.get("show") == "useManual")
     assert manual["content"][0]["props"]["type"] == "password"
-    assert any(node.get("show") == "useCloud" for node in account)
-    button = next(node for node in account if node["component"] == "VBtn")
-    assert button["action"] == "verifyLogin" and button["bind"]["text"] == "verifyLabel"
+    cloud = next(node for node in account if node.get("show") == "useCloud")
+    for group, label in ((manual, "验证手动 Cookie"), (cloud, "验证 CookieCloud 登录")):
+        button = next(node for node in group["content"] if node["component"] == "VBtn")
+        assert button["action"] == "verifyLogin" and button["text"] == label
     assert any(node["component"] == "VExpansionPanels" for node in account)
     switches = cards[0]["content"][2]["content"][0]["content"]
     for column in switches[:2]:

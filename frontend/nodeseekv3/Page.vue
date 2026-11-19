@@ -1,6 +1,7 @@
 <script setup>
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { readMoviePilotResponse } from './MoviePilotResponse'
+import PluginDialog from './PluginDialog.vue'
 import { renderNodes } from './RenderNodes'
 
 const props = defineProps({
@@ -12,7 +13,18 @@ const emit = defineEmits(['switch', 'close'])
 const page = shallowRef([])
 const loading = ref(true)
 const loadFailed = ref(false)
+const appMode = ref(false)
 const controller = new AbortController()
+
+function updateAppMode() {
+  const preference = localStorage.getItem('ui-mode')
+  const { userAgent, userAgentData, maxTouchPoints } = navigator
+  const mobile = userAgentData?.mobile === true ||
+    /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|CriOS/i.test(userAgent) ||
+    (/Macintosh/i.test(userAgent) && maxTouchPoints > 1)
+  appMode.value = document.documentElement.dataset.nativeChrome === 'active' || preference === 'app' ||
+    (preference !== 'desktop' && mobile && window.innerWidth < 1280)
+}
 
 async function load() {
   loading.value = true
@@ -31,30 +43,40 @@ async function load() {
 }
 
 const Layout = () => renderNodes(page.value)
-onMounted(load)
-onUnmounted(() => controller.abort())
+onMounted(() => {
+  updateAppMode()
+  window.addEventListener('resize', updateAppMode)
+  load()
+})
+onUnmounted(() => {
+  window.removeEventListener('resize', updateAppMode)
+  controller.abort()
+})
 </script>
 
 <template>
-  <div>
-    <VCardTitle class="d-flex align-center justify-space-between">
-      NodeSeek 论坛签到
-      <VBtn icon="mdi-close" variant="text" aria-label="关闭" @click="emit('close')" />
-    </VCardTitle>
-    <VDivider />
-    <VCardText v-if="loading"><VProgressLinear indeterminate aria-label="正在加载签到数据" /></VCardText>
-    <VCardText v-else-if="loadFailed">
-      <VAlert type="error" variant="tonal">签到数据加载失败，请重试。</VAlert>
-      <VBtn class="mt-3" variant="tonal" @click="load">重试</VBtn>
-    </VCardText>
-    <VCardText v-else><Layout /></VCardText>
-    <VCardActions
-      v-if="show_switch"
-      class="app-dialog-actions position-sticky bottom-0 justify-end"
-      style="z-index: 1"
-    >
-      <VBtn icon="mdi-cog-outline" color="primary" variant="text"
-            aria-label="插件配置" title="插件配置" @click="emit('switch')" />
-    </VCardActions>
-  </div>
+  <PluginDialog title="NodeSeek 论坛签到" body-class="min-h-40" @close="emit('close')">
+    <div v-if="loading"><VProgressLinear indeterminate aria-label="正在加载签到数据" /></div>
+    <div v-else-if="loadFailed">
+      <VAlert type="error" title="数据加载失败">
+        <div>签到数据加载失败，请重试。</div>
+        <VBtn class="mt-3" color="error" variant="tonal" @click="load">重试</VBtn>
+      </VAlert>
+    </div>
+    <div v-else><Layout /></div>
+    <template #actions>
+      <VFab
+        v-if="show_switch"
+        icon="mdi-cog"
+        location="bottom"
+        size="x-large"
+        fixed
+        app
+        appear
+        :class="{ 'mb-10': appMode }"
+        aria-label="插件配置"
+        @click="emit('switch')"
+      />
+    </template>
+  </PluginDialog>
 </template>

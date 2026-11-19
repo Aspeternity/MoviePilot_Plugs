@@ -423,7 +423,7 @@ class NodeSeekV3(_PluginBase):
 
     @staticmethod
     def get_render_mode() -> tuple[str, str]:
-        return "vue", "dist/assets/v4"
+        return "vue", "dist/assets/v5"
 
     def get_api(self) -> list[dict[str, Any]]:
         """注册需要管理员身份的只读登录验证接口。"""
@@ -1171,6 +1171,24 @@ class NodeSeekV3(_PluginBase):
             ]},
         ])
 
+    @staticmethod
+    def _verification_controls(title: str) -> list[dict[str, Any]]:
+        return [
+            {"component": "VBtn", "action": "verifyLogin", "text": title,
+             "bind": {"loading": "verifying", "disabled": "busy", "aria-busy": "verifying"},
+             "props": {"color": "primary", "variant": "tonal", "class": "text-none mt-3", "type": "button",
+                       "prepend-icon": "mdi-shield-check-outline"}},
+            {"component": "div", "props": {"role": "status", "aria-live": "polite", "data-login-feedback": "",
+                                          "tabindex": -1}, "content": [
+                {"component": "p", "show": "checkingLogin", "props": {"class": "text-caption mt-2"},
+                 "text": "正在验证登录…"},
+                {"component": "VAlert", "show": "loginMessage", "bind": {"type": "loginAlertType"},
+                 "props": {"variant": "tonal", "density": "compact", "class": "mt-3"}, "content": [
+                    {"component": "span", "bind": {"textContent": "loginMessage"}},
+                ]},
+            ]},
+        ]
+
     def _account_form(self) -> dict[str, Any]:
         """呈现登录方式、验证结果和代理设置。"""
         return self._card("登录与网络", "mdi-shield-account-outline", [
@@ -1189,24 +1207,19 @@ class NodeSeekV3(_PluginBase):
                     (False, "mdi-key-outline", "useManual", "手动 Cookie"),
                 )
             ]},
-            {"component": "div", "show": "useManual", "content": [
+            {"component": "div", "show": "useManual", "props": {"class": "mb-4"}, "content": [
                 {"component": "VTextField", "props": {
                     "model": "cookie", "label": "NodeSeek Cookie", "type": "password", "autocomplete": "off",
                     "hide-details": True, "variant": "outlined",
                 }},
                 {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2"},
                  "text": "粘贴已登录浏览器的 NodeSeek Cookie。Cookie 是登录凭据，请妥善保管。"},
+                *self._verification_controls("验证手动 Cookie"),
             ]},
-            {"component": "p", "show": "useCloud", "props": {"class": "text-body-2 text-medium-emphasis mb-0"},
-             "text": "使用 MoviePilot 的 CookieCloud。"},
-            {"component": "VBtn", "action": "verifyLogin",
-             "bind": {"text": "verifyLabel", "loading": "verifying", "disabled": "busy"},
-             "props": {"color": "primary", "variant": "tonal", "class": "text-none mt-3", "type": "button",
-                       "prepend-icon": "mdi-shield-check-outline"}},
-            {"component": "div", "props": {"role": "status", "aria-live": "polite", "data-login-feedback": "",
-                                          "tabindex": -1, "class": "mb-4"}, "content": [
-                {"component": "VAlert", "show": "loginMessage", "bind": {"type": "loginAlertType", "text": "loginMessage"},
-                 "props": {"variant": "tonal", "density": "compact", "class": "mt-3"}},
+            {"component": "div", "show": "useCloud", "props": {"class": "mb-4"}, "content": [
+                {"component": "p", "props": {"class": "text-body-2 text-medium-emphasis mb-0"},
+                 "text": "使用 MoviePilot 的 CookieCloud。"},
+                *self._verification_controls("验证 CookieCloud 登录"),
             ]},
             {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
                 {"component": "VExpansionPanel", "props": {"elevation": 0, "class": "border rounded-lg"}, "content": [
@@ -1214,8 +1227,8 @@ class NodeSeekV3(_PluginBase):
                         {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
                          "text": "mdi-lan-connect"},
                         {"component": "span", "props": {"class": "font-weight-medium"}, "text": "代理与 User-Agent"},
-                        {"component": "VChip", "bind": {"text": "proxyLabel"},
-                         "props": {"size": "small", "variant": "tonal", "class": "ml-3"}},
+                        {"component": "VChip", "props": {"size": "small", "variant": "tonal", "class": "ml-3"},
+                         "content": [{"component": "span", "bind": {"textContent": "proxyLabel"}}]},
                     ]},
                     {"component": "VExpansionPanelText", "content": [
                         {"component": "VSwitch", "props": {
