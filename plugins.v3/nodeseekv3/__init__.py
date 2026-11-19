@@ -601,7 +601,7 @@ class NodeSeekV3(_PluginBase):
         return [dict(last)] if isinstance(last, dict) and last else []
 
     def _account_form(self) -> dict[str, Any]:
-        """呈现登录方式、实时验证结果和可折叠的网络设置。"""
+        """呈现登录方式、实时验证结果和可折叠的网络与浏览器设置。"""
         verify_path = json.dumps(f"plugin/{self.__class__.__name__}/cookiecloud_verify")
         state_key = json.dumps(_VERIFY_STATE_KEY)
         state = f"model[Symbol.for({state_key})]"
@@ -659,7 +659,7 @@ class NodeSeekV3(_PluginBase):
             ]},
             {"component": "div", "props": {"show": "{{cookiecloud}}", "class": "mb-4"}, "content": [
                 {"component": "p", "props": {"class": "text-body-2 text-medium-emphasis mb-3"},
-                 "text": "使用 MoviePilot 的 CookieCloud。验证采用下方当前网络设置，仅检查登录。"},
+                 "text": "使用 MoviePilot 的 CookieCloud。验证采用下方当前设置，仅检查登录。"},
                 {"component": "VBtn", "props": {
                     "color": "primary", "variant": "tonal", "class": "text-none", "type": "button",
                     "prepend-icon": "mdi-shield-check-outline", "onclick": verify_click,
@@ -683,7 +683,7 @@ class NodeSeekV3(_PluginBase):
                     {"component": "VExpansionPanelTitle", "props": {"class": "px-4"}, "content": [
                         {"component": "VIcon", "props": {"size": "small", "class": "mr-2"},
                          "text": "mdi-lan-connect"},
-                        {"component": "span", "props": {"class": "font-weight-medium"}, "text": "网络设置"},
+                        {"component": "span", "props": {"class": "font-weight-medium"}, "text": "网络与浏览器"},
                         {"component": "VChip", "props": {"size": "small", "variant": "tonal", "class": "ml-3"},
                          "content": [{"component": "span", "props": {
                              "textContent": "{{use_proxy ? '使用系统代理' : '直连'}}",
@@ -699,8 +699,6 @@ class NodeSeekV3(_PluginBase):
                             "hint": "可选。留空使用宿主浏览器的默认值。", "persistent-hint": True,
                             "maxlength": 1024, "class": "mt-2",
                         }},
-                        {"component": "p", "props": {"class": "text-caption text-medium-emphasis mt-2"},
-                         "text": "保存后，定时签到才会使用新的网络设置。"},
                     ]},
                 ]},
             ]},
